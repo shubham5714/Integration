@@ -1,0 +1,26 @@
+type: action
+definition:
+  title: Power of Three
+  description: Raise a number to the power of three
+  name: power_of_three
+  namespace: tracecat.examples
+  display_group: Tracecat Examples
+  expects:
+    number:
+      type: int
+      description: A number to raise to a power
+      default: 10
+  steps:
+    - ref: first
+      action: core.transform.reshape
+      args:
+        value: ${{ inputs.number }}
+    - ref: second
+      action: core.transform.reshape
+      args:
+        value: ${{ steps.first.result * inputs.number }}
+    - ref: third
+      action: core.transform.reshape
+      args:
+        value: ${{ steps.second.result * inputs.number }}
+  returns: ${{ steps.third.result }}

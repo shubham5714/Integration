@@ -3117,9 +3117,9 @@ def _local_elastic_params(command: str) -> Dict[str, Any]:
         "proxy": False,
         "fetch_time_field": "@timestamp",
         "fetch_index": ".alerts-security.alerts-default",
-        "fetch_query": "kibana.alert.rule.type:\"query\"",
+        "fetch_query": "*",
         "raw_query": "",
-        "fetch_time": "24 hour"
+        "fetch_time": "1 hour"
         ,
         "fetch_size": 1,
         "raw_logs_fetch_size": 5,

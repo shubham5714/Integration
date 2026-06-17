@@ -892,7 +892,7 @@ def search_command(args, proxies):
         else:
             response = execute_raw_query(es, query_dsl, index, size, base_page)
     else:
-        que = QueryString(query=query)
+        que = QueryString(query=_normalize_query_string_operators(query))
         search = Search(using=es, index=index).query(que)[base_page: base_page + size]
         if explain:
             search = search.extra(explain=True)
@@ -1017,7 +1017,9 @@ def test_time_field_query(es):
 
 def test_fetch_query(es):
     """Run the configured fetch query and return the raw response."""
-    query = QueryString(query=str(TIME_FIELD) + ":* AND " + FETCH_QUERY)
+    query = QueryString(
+        query=str(TIME_FIELD) + ":* AND " + _normalize_query_string_operators(FETCH_QUERY)
+    )
     search = Search(using=es, index=FETCH_INDEX).query(query)[0:1]
 
     if ELASTIC_SEARCH_CLIENT in (ELASTICSEARCH_V9, ELASTICSEARCH_V8, OPEN_SEARCH):
@@ -1447,8 +1449,105 @@ def _is_threat_match_rule_source(source: Dict[str, Any]) -> bool:
 _SIEM_RAW_LOG_SORT: List[Dict[str, str]] = [{"@timestamp": "asc"}]
 
 
+def _fetch_progress_print(stage: str, message: str) -> None:
+    """Print fetch progress to stdout (visible in script / Prefect runs)."""
+    print(f"[{stage}] {message}", flush=True)
+
+
+def _format_time_range_label(time_range: Any) -> str:
+    """Human-readable time range for progress output."""
+    if time_range is None:
+        return "n/a"
+    if isinstance(time_range, dict):
+        if "gte" in time_range or "lte" in time_range or "gt" in time_range or "lt" in time_range:
+            start = time_range.get("gte") or time_range.get("gt")
+            end = time_range.get("lte") or time_range.get("lt")
+            return f"start={start!r} end={end!r}"
+        if "range" in time_range:
+            return _format_time_range_label(time_range["range"])
+        for field in ("@timestamp", TIME_FIELD):
+            if field in time_range:
+                return f"{field} {_format_time_range_label(time_range[field])}"
+        return json.dumps(time_range, default=str, separators=(",", ":"))
+    return str(time_range)
+
+
+def _extract_time_range_from_dsl(query_dsl: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort extract ``@timestamp`` / ``TIME_FIELD`` range from a query DSL body."""
+
+    def _walk(obj: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(obj, dict):
+            rng = obj.get("range")
+            if isinstance(rng, dict):
+                for field in ("@timestamp", TIME_FIELD):
+                    bounds = rng.get(field)
+                    if isinstance(bounds, dict):
+                        return bounds
+            for val in obj.values():
+                found = _walk(val)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _walk(item)
+                if found is not None:
+                    return found
+        return None
+
+    return _walk(query_dsl)
+
+
+def _format_query_for_progress(query: Any) -> str:
+    """Compact one-line query text for progress output."""
+    if query is None:
+        return "n/a"
+    if isinstance(query, str):
+        return query.strip() or "n/a"
+    return json.dumps(query, separators=(",", ":"), default=str)
+
+
+_QUERY_STRING_QUOTED_SPLIT = re.compile(r'("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')')
+
+
+def _normalize_query_string_operators(query: str) -> str:
+    """Uppercase Lucene ``and`` / ``or`` boolean operators outside quoted strings."""
+    if not isinstance(query, str) or not query:
+        return query
+    parts = _QUERY_STRING_QUOTED_SPLIT.split(query)
+    normalized: List[str] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            normalized.append(part)
+        else:
+            part = re.sub(r"\band\b", "AND", part, flags=re.IGNORECASE)
+            part = re.sub(r"\bor\b", "OR", part, flags=re.IGNORECASE)
+            normalized.append(part)
+    return "".join(normalized)
+
+
+def _normalize_dsl_query_string_operators(dsl: Any) -> Any:
+    """Recursively normalize ``query_string.query`` values in a DSL body."""
+    if isinstance(dsl, dict):
+        out: Dict[str, Any] = {}
+        for key, val in dsl.items():
+            if key == "query_string" and isinstance(val, dict):
+                qs = dict(val)
+                q = qs.get("query")
+                if isinstance(q, str):
+                    qs["query"] = _normalize_query_string_operators(q)
+                out[key] = qs
+            else:
+                out[key] = _normalize_dsl_query_string_operators(val)
+        return out
+    if isinstance(dsl, list):
+        return [_normalize_dsl_query_string_operators(item) for item in dsl]
+    return dsl
+
+
 def _incident_query_json_string(payload: Any) -> str:
     """One-line JSON for ``incident[\"query\"]`` (compact, no pretty-print)."""
+    if isinstance(payload, dict):
+        payload = _normalize_dsl_query_string_operators(payload)
     return json.dumps(payload, separators=(",", ":"), default=str)
 
 
@@ -1468,10 +1567,40 @@ def _raw_logs_info(
         f"source_id={incident.get('source_id')!r}",
     ]
     for key, val in extra.items():
-        if val is None:
+        if val is None or key in ("query", "indices", "time_range"):
             continue
         parts.append(f"{key}={val}")
     _log().info(" ".join(parts))
+
+    alert_name = incident.get("name") or incident.get("source_id") or "unknown"
+    if phase == "execute":
+        query = extra.get("query")
+        indices = extra.get("indices")
+        time_range = extra.get("time_range")
+        if time_range is None and isinstance(query, dict):
+            time_range = _extract_time_range_from_dsl(query)
+        query_text = _format_query_for_progress(query if query is not None else incident.get("query"))
+        indices_text = json.dumps(indices, default=str) if indices is not None else "n/a"
+        time_range_text = _format_time_range_label(time_range)
+        _fetch_progress_print(
+            "raw_logs",
+            f"fetching alert={alert_name!r} rule_type={rule_type} "
+            f"method={fetch_method} indices={indices_text}\n"
+            f"  time_range: {time_range_text}\n"
+            f"  query: {query_text}",
+        )
+    elif phase == "done":
+        _fetch_progress_print(
+            "raw_logs",
+            f"done alert={alert_name!r} rule_type={rule_type} "
+            f"raw_logs_count={extra.get('raw_logs_count', 0)}",
+        )
+    elif phase == "failed":
+        _fetch_progress_print(
+            "raw_logs",
+            f"failed alert={alert_name!r} rule_type={rule_type} "
+            f"error={extra.get('error')!r}",
+        )
 
 
 def _alert_ancestors_indices_and_ids_dsl(
@@ -1800,9 +1929,9 @@ def _enrich_incident_with_query_rule_raw_logs(
         return
 
     indices, query_dsl, fetch_method = payload
-    _raw_logs_info("execute", "query", fetch_method, incident)
     incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
+    _raw_logs_info("execute", "query", fetch_method, incident, query=query_dsl, indices=indices)
     try:
         response = execute_raw_query(
             es, query_dsl, index=indices, size=RAW_LOGS_FETCH_SIZE, page=0
@@ -1825,13 +1954,7 @@ def _enrich_incident_with_query_rule_raw_logs(
         )
     except Exception as ex:
         incident["raw_logs_error"] = str(ex)
-        _raw_logs_info(
-            "failed",
-            "query",
-            fetch_method,
-            incident,
-            error=str(ex),
-        )
+        _raw_logs_info("failed", "query", fetch_method, incident, error=str(ex))
         _log().debug(
             f"Query-rule raw_logs: failed source_id={incident.get('source_id')!r} error={ex}"
         )
@@ -1850,9 +1973,9 @@ def _enrich_incident_with_new_terms_raw_logs(
         return
 
     indices, query_dsl, fetch_method = payload
-    _raw_logs_info("execute", "new_terms", fetch_method, incident)
     incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
+    _raw_logs_info("execute", "new_terms", fetch_method, incident, query=query_dsl, indices=indices)
     try:
         response = execute_raw_query(
             es, query_dsl, index=indices, size=RAW_LOGS_FETCH_SIZE, page=0
@@ -1875,13 +1998,7 @@ def _enrich_incident_with_new_terms_raw_logs(
         )
     except Exception as ex:
         incident["raw_logs_error"] = str(ex)
-        _raw_logs_info(
-            "failed",
-            "new_terms",
-            fetch_method,
-            incident,
-            error=str(ex),
-        )
+        _raw_logs_info("failed", "new_terms", fetch_method, incident, error=str(ex))
         _log().debug(
             f"New-terms raw_logs: failed source_id={incident.get('source_id')!r} error={ex}"
         )
@@ -1900,9 +2017,9 @@ def _enrich_incident_with_eql_rule_raw_logs(
         return
 
     indices, query_dsl, fetch_method = payload
-    _raw_logs_info("execute", "eql", fetch_method, incident)
     incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
+    _raw_logs_info("execute", "eql", fetch_method, incident, query=query_dsl, indices=indices)
     try:
         response = execute_raw_query(
             es, query_dsl, index=indices, size=RAW_LOGS_FETCH_SIZE, page=0
@@ -1925,13 +2042,7 @@ def _enrich_incident_with_eql_rule_raw_logs(
         )
     except Exception as ex:
         incident["raw_logs_error"] = str(ex)
-        _raw_logs_info(
-            "failed",
-            "eql",
-            fetch_method,
-            incident,
-            error=str(ex),
-        )
+        _raw_logs_info("failed", "eql", fetch_method, incident, error=str(ex))
         _log().debug(
             f"EQL-rule raw_logs: failed source_id={incident.get('source_id')!r} error={ex}"
         )
@@ -1950,9 +2061,9 @@ def _enrich_incident_with_threat_match_raw_logs(
         return
 
     indices, query_dsl, fetch_method = payload
-    _raw_logs_info("execute", "threat_match", fetch_method, incident)
     incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
+    _raw_logs_info("execute", "threat_match", fetch_method, incident, query=query_dsl, indices=indices)
     try:
         response = execute_raw_query(
             es, query_dsl, index=indices, size=RAW_LOGS_FETCH_SIZE, page=0
@@ -1975,13 +2086,7 @@ def _enrich_incident_with_threat_match_raw_logs(
         )
     except Exception as ex:
         incident["raw_logs_error"] = str(ex)
-        _raw_logs_info(
-            "failed",
-            "threat_match",
-            fetch_method,
-            incident,
-            error=str(ex),
-        )
+        _raw_logs_info("failed", "threat_match", fetch_method, incident, error=str(ex))
         _log().debug(
             f"Threat-match raw_logs: failed source_id={incident.get('source_id')!r} error={ex}"
         )
@@ -2407,7 +2512,14 @@ def _enrich_incident_with_esql_raw_logs(
     incident["raw_logs"] = []
 
     fetch_method = "esql_post_query"
-    _raw_logs_info("execute", "esql", fetch_method, incident)
+    _raw_logs_info(
+        "execute",
+        "esql",
+        fetch_method,
+        incident,
+        query=modified,
+        time_range={"gte": start_iso, "lte": end_iso},
+    )
 
     try:
         payload = _perform_esql_json(es, modified, filter_dsl=time_filter)
@@ -2432,13 +2544,7 @@ def _enrich_incident_with_esql_raw_logs(
         )
     except Exception as ex:
         incident["raw_logs_error"] = str(ex)
-        _raw_logs_info(
-            "failed",
-            "esql",
-            fetch_method,
-            incident,
-            error=str(ex),
-        )
+        _raw_logs_info("failed", "esql", fetch_method, incident, error=str(ex))
         _log().debug(
             f"ES|QL raw_logs: failed source_id={incident.get('source_id')!r} error={ex}"
         )
@@ -2536,9 +2642,9 @@ def _enrich_incident_with_threshold_raw_logs(
         return
 
     indices, query_dsl, fetch_method = query_payload
-    _raw_logs_info("execute", "threshold", fetch_method, incident)
     incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
+    _raw_logs_info("execute", "threshold", fetch_method, incident, query=query_dsl, indices=indices)
     _log().debug(
         "Threshold raw_logs: executing query "
         f"source_id={incident.get('source_id')!r}, indices={indices}"
@@ -2573,13 +2679,7 @@ def _enrich_incident_with_threshold_raw_logs(
         )
     except Exception as ex:
         incident["raw_logs_error"] = str(ex)
-        _raw_logs_info(
-            "failed",
-            "threshold",
-            fetch_method,
-            incident,
-            error=str(ex),
-        )
+        _raw_logs_info("failed", "threshold", fetch_method, incident, error=str(ex))
         _log().debug(
             f"Threshold raw_logs: failed source_id={incident.get('source_id')!r}, error={ex}"
         )
@@ -2744,7 +2844,7 @@ def query_string_to_dict(raw_query) -> Dict:
 
 def execute_raw_query(es, raw_query, index=None, size=None, page=None):
     """Run a raw query DSL body against the configured fetch index."""
-    body = query_string_to_dict(raw_query)
+    body = _normalize_dsl_query_string_operators(query_string_to_dict(raw_query))
     requested_index = index or FETCH_INDEX
 
     if isinstance(size, int):
@@ -2786,15 +2886,30 @@ def fetch_incidents(proxies):
         "Fetch query time bounds: "
         f"start={time_bounds.get('gt')!r}, end={time_bounds.get('lt')!r}"
     )
+    time_range_label = _format_time_range_label(time_bounds)
 
     if RAW_QUERY:
         _log().info(f"Fetch raw_query mode enabled. index={FETCH_INDEX!r}")
         _log().debug(f"Fetch raw_query payload: {RAW_QUERY}")
+        query_display = _format_query_for_progress(RAW_QUERY)
+        _fetch_progress_print(
+            "alerts",
+            f"fetching index={FETCH_INDEX!r} size={FETCH_SIZE}\n"
+            f"  time_range: {time_range_label}\n"
+            f"  query: {query_display}",
+        )
         response = execute_raw_query(es, RAW_QUERY)
     else:
-        query = QueryString(query="(" + FETCH_QUERY + ") AND " + TIME_FIELD + ":*")
+        fetch_query = _normalize_query_string_operators(FETCH_QUERY)
+        query = QueryString(query="(" + fetch_query + ") AND " + TIME_FIELD + ":*")
         search = Search(using=es, index=FETCH_INDEX).filter(time_range_dict)
         search = search.sort({TIME_FIELD: {"order": "asc"}})[0:FETCH_SIZE].query(query)
+        _fetch_progress_print(
+            "alerts",
+            f"fetching index={FETCH_INDEX!r} size={FETCH_SIZE}\n"
+            f"  time_range: {time_range_label}\n"
+            f"  query: ({fetch_query}) AND {TIME_FIELD}:*",
+        )
         _log().info(
             "Fetch DSL execution: "
             f"index={FETCH_INDEX!r}, size={FETCH_SIZE}, sort_field={TIME_FIELD!r}, sort_order='asc'"
@@ -2808,6 +2923,10 @@ def fetch_incidents(proxies):
 
     _log().debug(f"Fetch incidents response: {response}")
     _, total_results = get_total_results(response)
+    _fetch_progress_print(
+        "alerts",
+        f"fetched {total_results} alert hit(s); converting to incidents",
+    )
 
     incidents: List = []
     if total_results > 0:
@@ -2821,8 +2940,14 @@ def fetch_incidents(proxies):
             _state().set_last_run({"time": str(last_fetch)})
 
         _log().info(f"Extracted {len(incidents)} incidents.")
+        _fetch_progress_print(
+            "alerts",
+            f"extracted {len(incidents)} incident(s); raw_log enrichment complete",
+        )
         for inc in incidents:
             insert_incident_row_in_supabase(inc)
+    else:
+        _fetch_progress_print("alerts", "no alert hits in selected time range")
     _output().emit_incidents(incidents)
 
 
@@ -3117,11 +3242,11 @@ def _local_elastic_params(command: str) -> Dict[str, Any]:
         "proxy": False,
         "fetch_time_field": "@timestamp",
         "fetch_index": ".alerts-security.alerts-default",
-        "fetch_query": "*",
+        "fetch_query": "kibana.alert.rule.name : *SNMP*",
         "raw_query": "",
-        "fetch_time": "1 hour"
+        "fetch_time": "24 hour"
         ,
-        "fetch_size": 1,
+        "fetch_size": 20,
         "raw_logs_fetch_size": 5,
         "time_method": "Simple-Date",
         "timeout": 60,

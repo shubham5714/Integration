@@ -26,6 +26,7 @@ import requests
 import urllib3
 from dateutil.parser import parse
 from prefect import flow, task
+from prefect.blocks.system import Secret
 
 try:
     from supabase import Client as SupabaseClient, create_client  # type: ignore[import-not-found]
@@ -350,7 +351,10 @@ OPEN_SEARCH = "OpenSearch"
 ES_DEFAULT_DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss.SSSSSS"
 PYTHON_DEFAULT_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpoaHNpamlnb3VwcXJvenRkcmR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTcwNjgyODksImV4cCI6MjA3MjY0NDI4OX0.Mxq7DYbKV9OXHS7eE1YpdQ4F8Htld0Vt6FwlfOpX8kQ"
+
+supabase_api_key = await Secret.load("supabase-api-key")
+SUPABASE_ANON_KEY = supabase_api_key.get()
+
 # Same incident table as ``drx-securonix.insert_incident_row_in_supabase``.
 SUPABASE_DEV_TICKETS_TABLE = "dev_tickets"
 # Fields kept in-memory for fetch/export but not persisted on insert.

@@ -353,6 +353,7 @@ PYTHON_DEFAULT_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
 
 supabase_api_key = Secret.load("supabase-api-key")
+print(supabase_api_key)
 SUPABASE_ANON_KEY = supabase_api_key.get()
 
 # Same incident table as ``drx-securonix.insert_incident_row_in_supabase``.

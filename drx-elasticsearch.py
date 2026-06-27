@@ -352,8 +352,7 @@ ES_DEFAULT_DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss.SSSSSS"
 PYTHON_DEFAULT_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
 
-supabase_api_key = Secret.load("supabase-api-key")
-print(supabase_api_key)
+supabase_api_key = await Secret.load("supabase-api-key")
 SUPABASE_ANON_KEY = supabase_api_key.get()
 
 # Same incident table as ``drx-securonix.insert_incident_row_in_supabase``.
@@ -1376,6 +1375,19 @@ def _extract_threshold_query_filters(rule_filters: Any) -> List[Dict[str, Any]]:
     return filters
 
 
+def _rule_query_dsl_clause(rule_query: Any) -> Dict[str, Any]:
+    """Kibana rule query text as Elasticsearch ``kql`` query DSL."""
+    return {"kql": {"query": str(rule_query).strip()}}
+
+
+def _bool_query_with_rule_text(rule_query: Any, filter_clauses: Any) -> Dict[str, Any]:
+    """Build a ``bool`` query with KQL rule text and time/extra filters for raw-log fetch."""
+    rule_clause = _rule_query_dsl_clause(rule_query)
+    if isinstance(filter_clauses, list):
+        return {"filter": [rule_clause, *filter_clauses]}
+    return {"filter": [rule_clause, filter_clauses]}
+
+
 def _get_alert_field(source: Dict[str, Any], key: str) -> Any:
     """Read alert field from flat dotted keys, mixed-prefix maps, or nested dicts."""
     if not isinstance(source, dict):
@@ -1653,9 +1665,9 @@ def _build_query_rule_raw_logs_query(
     """Return ``(indices, query_dsl, fetch_method)`` for query-rule raw logs, or ``None``.
 
     Prefer ``kibana.alert.ancestors`` (``ids`` on backing index). Else ``bool`` with
-    ``must.query_string`` (rule text as-is), ``filter`` = ``@timestamp`` range (plus
-    rule ``filters`` when present). Sort ``_SIEM_RAW_LOG_SORT``; size from
-    ``RAW_LOGS_FETCH_SIZE`` in ``execute_raw_query``. No aggregations.
+    ``kql`` (rule text), ``filter`` = ``@timestamp`` range (plus rule ``filters`` when
+    present). Sort ``_SIEM_RAW_LOG_SORT``; size from ``RAW_LOGS_FETCH_SIZE`` in
+    ``execute_raw_query``. No aggregations.
     """
     if not _is_query_rule_source(source):
         return None
@@ -1700,10 +1712,7 @@ def _build_query_rule_raw_logs_query(
     else:
         filter_part = range_clause
 
-    bool_query: Dict[str, Any] = {
-        "must": {"query_string": {"query": str(rule_query)}},
-        "filter": filter_part,
-    }
+    bool_query = _bool_query_with_rule_text(rule_query, filter_part)
 
     indices = _rule_indices_for_raw_logs(source)
     query_dsl: Dict[str, Any] = {
@@ -1714,7 +1723,7 @@ def _build_query_rule_raw_logs_query(
         "Query-rule raw_logs DSL: "
         f"indices={indices}, window=({start_iso!r}, {end_iso!r})"
     )
-    return indices, query_dsl, "bool_query_time_window"
+    return indices, query_dsl, "kql_bool_time_window"
 
 
 def _new_terms_field_value_pairs(source: Dict[str, Any]) -> List[Tuple[str, Any]]:
@@ -1745,9 +1754,9 @@ def _build_new_terms_raw_logs_query(
 ) -> Optional[Tuple[List[str], Dict[str, Any], str]]:
     """Return ``(indices, query_dsl, fetch_method)`` for new_terms-rule raw logs, or ``None``.
 
-    Prefer ``kibana.alert.ancestors`` (``ids``). Else ``bool`` with ``must.query_string``
-    (rule query), ``filter`` = ``@timestamp`` range + ``term`` per new term field/value
-    + optional rule ``filters``. Same sort/size pattern as query-rule fallback.
+    Prefer ``kibana.alert.ancestors`` (``ids``). Else ``bool`` with ``kql`` (rule query),
+    ``filter`` = ``@timestamp`` range + ``term`` per new term field/value + optional rule
+    ``filters``. Same sort/size pattern as query-rule fallback.
     """
     if not _is_new_terms_rule_source(source):
         return None
@@ -1792,10 +1801,7 @@ def _build_new_terms_raw_logs_query(
         filter_clauses.append({"term": {field: val}})
     filter_clauses.extend(_extract_threshold_query_filters(rule_filters))
 
-    bool_query: Dict[str, Any] = {
-        "must": {"query_string": {"query": str(rule_query).strip()}},
-        "filter": filter_clauses,
-    }
+    bool_query = _bool_query_with_rule_text(rule_query, filter_clauses)
 
     indices = _rule_indices_for_raw_logs(source)
     query_dsl: Dict[str, Any] = {
@@ -1807,7 +1813,7 @@ def _build_new_terms_raw_logs_query(
         f"indices={indices!r} window=({start_iso!r}, {end_iso!r}) "
         f"entity_terms={len(entity_pairs)}"
     )
-    return indices, query_dsl, "bool_query_time_window"
+    return indices, query_dsl, "kql_bool_time_window"
 
 
 def _build_eql_raw_logs_query(
@@ -1815,9 +1821,9 @@ def _build_eql_raw_logs_query(
 ) -> Optional[Tuple[List[str], Dict[str, Any], str]]:
     """Return ``(indices, query_dsl, fetch_method)`` for SIEM EQL-rule raw logs, or ``None``.
 
-    Prefer ``kibana.alert.ancestors`` (``ids``). Else ``bool`` with ``must.query_string``
-    (rule ``parameters.query`` as plain string), ``filter`` = ``@timestamp`` range (single
-    object when there are no extra rule filters) + optional ``parameters.filters``.
+    Prefer ``kibana.alert.ancestors`` (``ids``). Else ``bool`` with ``kql`` (rule
+    ``parameters.query``), ``filter`` = ``@timestamp`` range (single object when there are
+    no extra rule filters) + optional ``parameters.filters``.
     No aggregations; same sort as query/new_terms.
     """
     if not _is_eql_rule_source(source):
@@ -1863,10 +1869,7 @@ def _build_eql_raw_logs_query(
     else:
         filter_part = range_clause
 
-    bool_query: Dict[str, Any] = {
-        "must": {"query_string": {"query": str(rule_query).strip()}},
-        "filter": filter_part,
-    }
+    bool_query = _bool_query_with_rule_text(rule_query, filter_part)
 
     indices = _rule_indices_for_raw_logs(source)
     query_dsl: Dict[str, Any] = {
@@ -1877,7 +1880,7 @@ def _build_eql_raw_logs_query(
         "EQL-rule raw_logs fallback DSL: "
         f"indices={indices}, window=({start_iso!r}, {end_iso!r})"
     )
-    return indices, query_dsl, "bool_query_time_window"
+    return indices, query_dsl, "kql_bool_time_window"
 
 
 def _build_threat_match_raw_logs_query(
@@ -1887,7 +1890,7 @@ def _build_threat_match_raw_logs_query(
 
     Only ``kibana.alert.ancestors`` (``ids`` on the backing event index). No fallback:
     indicator rules join threat indices and are not reproduced with a single
-    ``query_string`` + time window.
+    indicator rules join threat indices and are not reproduced with a single KQL + time window.
     """
     if not _is_threat_match_rule_source(source):
         return None
@@ -2454,13 +2457,87 @@ def _row_dict_to_event_original_value(row: Dict[str, Any]) -> str:
     return json.dumps(row, default=str)
 
 
+def _build_esql_raw_logs_ancestors_query(
+    source: Dict[str, Any],
+) -> Optional[Tuple[List[str], Dict[str, Any], str]]:
+    """Return ``(indices, query_dsl, fetch_method)`` when ancestors exist, else ``None``.
+
+  When ``kibana.alert.ancestors`` has index + id, fetch the backing document directly.
+  Otherwise the caller should fall back to the ES|QL ``/_query`` pipeline path.
+    """
+    if not _is_esql_rule_source(source):
+        return None
+    backing = _alert_ancestors_indices_and_ids_dsl(source)
+    if backing is None:
+        return None
+    indices, query_dsl = backing
+    _log().debug(
+        "ES|QL raw_logs: ancestors ids query "
+        f"indices={indices!r} dsl_keys={list(query_dsl.keys())}"
+    )
+    return indices, query_dsl, "ancestors_ids"
+
+
 def _enrich_incident_with_esql_raw_logs(
     incident: Dict[str, Any], es: Any, source: Dict[str, Any]
 ) -> None:
-    """Run rule ES|QL over [@timestamp start, intended] and attach rows to ``raw_logs``."""
+    """Attach raw logs for ES|QL-rule alerts: ancestors ``ids`` first, else ES|QL pipeline.
+
+    When ancestors are present but yield zero ``event.original`` values, fall back to the
+    ES|QL ``/_query`` pipeline.
+    """
     if not _is_esql_rule_source(source):
         return
 
+    ancestors_payload = _build_esql_raw_logs_ancestors_query(source)
+    if ancestors_payload is not None:
+        indices, query_dsl, fetch_method = ancestors_payload
+        incident["raw_logs"] = []
+        incident["query"] = _incident_query_json_string(query_dsl)
+        _raw_logs_info("execute", "esql", fetch_method, incident, query=query_dsl, indices=indices)
+        try:
+            response = execute_raw_query(
+                es, query_dsl, index=indices, size=RAW_LOGS_FETCH_SIZE, page=0
+            )
+            hits = response.get("hits", {}).get("hits", [])
+            _append_raw_logs_event_original_from_hits(incident, hits)
+            n_raw = len(incident["raw_logs"])
+            _raw_logs_info(
+                "done",
+                "esql",
+                fetch_method,
+                incident,
+                es_hits=len(hits) if isinstance(hits, list) else 0,
+                raw_logs_count=n_raw,
+                hits_found=n_raw > 0,
+            )
+            _log().debug(
+                f"ES|QL raw_logs: ancestors done source_id={incident.get('source_id')!r} "
+                f"n={n_raw}"
+            )
+            if n_raw > 0:
+                return
+            _log().info(
+                "ES|QL raw_logs: ancestors returned 0 raw_logs; "
+                f"falling back to ES|QL pipeline source_id={incident.get('source_id')!r}"
+            )
+        except Exception as ex:
+            _raw_logs_info("failed", "esql", fetch_method, incident, error=str(ex))
+            _log().debug(
+                f"ES|QL raw_logs: ancestors failed source_id={incident.get('source_id')!r} "
+                f"error={ex}; falling back to ES|QL pipeline"
+            )
+
+        incident.pop("raw_logs_error", None)
+        incident["raw_logs"] = []
+
+    _enrich_incident_with_esql_pipeline_raw_logs(incident, es, source)
+
+
+def _enrich_incident_with_esql_pipeline_raw_logs(
+    incident: Dict[str, Any], es: Any, source: Dict[str, Any]
+) -> None:
+    """Run rule ES|QL over [@timestamp start, intended] and attach rows to ``raw_logs``."""
     intended = _alert_intended_timestamp_utc(source)
     rule_from = _get_alert_field(source, "kibana.alert.rule.from") or _get_alert_field(
         source, "kibana.alert.rule.parameters.from"
@@ -2558,7 +2635,11 @@ def _enrich_incident_with_esql_raw_logs(
 def _build_threshold_raw_logs_query(
     source: Dict[str, Any],
 ) -> Optional[Tuple[List[str], Dict[str, Any], str]]:
-    """Build ``(indices, query_dsl, fetch_method)`` for fetching raw logs of one threshold alert."""
+    """Build ``(indices, query_dsl, fetch_method)`` for fetching raw logs of one threshold alert.
+
+    Uses ``kql`` for ``parameters.query``, ``bool.filter`` for the incident time window,
+    rule filters, and ``threshold_result.terms`` bucket pins.
+    """
     rule_type = _get_alert_field(source, "kibana.alert.rule.type") or _get_alert_field(
         source, "kibana.alert.rule.parameters.type"
     )
@@ -2589,8 +2670,8 @@ def _build_threshold_raw_logs_query(
     bool_query: Dict[str, List[Dict[str, Any]]] = {
         "filter": [{"range": {"@timestamp": {"gte": start_time, "lte": end_time}}}]
     }
-    if rule_query:
-        bool_query["must"] = [{"query_string": {"query": str(rule_query)}}]
+    if rule_query and str(rule_query).strip():
+        bool_query["filter"].append(_rule_query_dsl_clause(rule_query))
 
     bool_query["filter"].extend(_extract_threshold_query_filters(rule_filters))
 
@@ -2619,7 +2700,7 @@ def _build_threshold_raw_logs_query(
         f"filters_count={len(rule_filters) if isinstance(rule_filters, list) else 0}"
     )
     _log().debug(f"Threshold raw_logs builder DSL: {json.dumps(query_dsl)}")
-    return indices, query_dsl, "threshold_bool_dsl"
+    return indices, query_dsl, "threshold_kql_dsl"
 
 
 def _enrich_incident_with_threshold_raw_logs(
@@ -2847,6 +2928,24 @@ def query_string_to_dict(raw_query) -> Dict:
     return body
 
 
+def _dsl_contains_kql(obj: Any) -> bool:
+    """Return True if a query DSL body uses Elasticsearch ``kql`` query clauses."""
+    if isinstance(obj, dict):
+        if "kql" in obj:
+            return True
+        return any(_dsl_contains_kql(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_dsl_contains_kql(item) for item in obj)
+    return False
+
+
+def _es_search_raw(es: Any, index: Any, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a search body without elasticsearch-dsl (needed for ``kql`` on ES 9)."""
+    if ELASTIC_SEARCH_CLIENT in (ELASTICSEARCH_V9, ELASTICSEARCH_V8):
+        return es.search(index=index, **body)
+    return es.search(index=index, body=body)
+
+
 def execute_raw_query(es, raw_query, index=None, size=None, page=None):
     """Run a raw query DSL body against the configured fetch index."""
     body = _normalize_dsl_query_string_operators(query_string_to_dict(raw_query))
@@ -2857,11 +2956,14 @@ def execute_raw_query(es, raw_query, index=None, size=None, page=None):
     if isinstance(page, int):
         body["from"] = page
 
-    search = Search(using=es, index=requested_index).update_from_dict(body)
-
-    if ELASTIC_SEARCH_CLIENT in (ELASTICSEARCH_V9, ELASTICSEARCH_V8, OPEN_SEARCH):
+    # elasticsearch-dsl has no ``Kql`` query class; send bodies with ``kql`` via raw client.
+    if _dsl_contains_kql(body):
+        response = _es_search_raw(es, requested_index, body)
+    elif ELASTIC_SEARCH_CLIENT in (ELASTICSEARCH_V9, ELASTICSEARCH_V8, OPEN_SEARCH):
+        search = Search(using=es, index=requested_index).update_from_dict(body)
         response = search.execute().to_dict()
     else:
+        search = Search(using=es, index=requested_index).update_from_dict(body)
         response = es.search(index=search._index, body=search.to_dict(), **search._params)
 
     _log().debug(f"Raw query response: {response}")
@@ -3239,7 +3341,7 @@ def _local_elastic_params(command: str) -> Dict[str, Any]:
     """Static integration params until Supabase configuration is merged in."""
     return {
         "url": "https://embark-group-f2a75d.es.asia-south1.gcp.elastic.cloud:443",
-        "client_type": ELASTICSEARCH_V8,
+        "client_type": ELASTICSEARCH_V9,
         "auth_type": API_KEY_AUTH,
         "credentials": {"identifier": "", "password": ""},
         "api_key_auth_credentials": {"identifier": "5fGUwJ4BKNdGrSgn4vdI", "password": "9lgzlcVDUIIzRFr5wPiTHw"},
@@ -3247,11 +3349,11 @@ def _local_elastic_params(command: str) -> Dict[str, Any]:
         "proxy": False,
         "fetch_time_field": "@timestamp",
         "fetch_index": ".alerts-security.alerts-default",
-        "fetch_query": "*",
+        "fetch_query": "kibana.alert.rule.type:\"esql\"",
         "raw_query": "",
-        "fetch_time": "24 hour"
+        "fetch_time": "80 hour"
         ,
-        "fetch_size": 20,
+        "fetch_size": 5,
         "raw_logs_fetch_size": 5,
         "time_method": "Simple-Date",
         "timeout": 60,

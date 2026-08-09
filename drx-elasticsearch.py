@@ -1218,7 +1218,7 @@ def incident_label_maker(source):
 
 
 _INCIDENT_EXPORT_DEFAULTS: Dict[str, Any] = {
-    "instance_name": "astra elastic",
+    "instance_name": "Elastic",
     "tenant_id": "d1708ffc-397e-43b6-8f0a-49306dcfc35d",
     "tenant_name": "Embark Group",
     "classifier": "test",

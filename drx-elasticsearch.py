@@ -2161,24 +2161,44 @@ def _esql_join_pipeline(segments: List[str]) -> str:
     return "\n".join(lines)
 
 
-def _esql_should_drop_raw_logs_segment(seg: str) -> bool:
-    """Drop eval date_trunc, stats, and post-aggregation threshold ``where`` clauses."""
-    s = seg.strip()
-    if not s:
-        return True
+def _esql_stats_metric_aliases(esql: str) -> List[str]:
+    """Extract ``alias`` names from ``STATS alias = expr, ... BY ...``."""
+    m = re.search(r"(?is)\bstats\b([\s\S]*?)(?:\bby\b|\||$)", esql)
+    if not m:
+        return []
+    body = re.sub(r"(?m)^\s*//.*$", "", m.group(1)).strip()
+    if not body:
+        return []
+    aliases: List[str] = []
+    for part in re.split(r",", body):
+        part = part.strip()
+        am = re.match(r"^([A-Za-z_][\w.]*)\s*=", part)
+        if am:
+            aliases.append(am.group(1))
+    return aliases
 
-    # Ignore leading comment lines so command detection works on commented pipelines.
+
+def _esql_segment_command(seg: str) -> str:
+    """Return the first non-comment command text for an ES|QL pipeline segment."""
     non_comment_lines = [
         ln.strip()
-        for ln in s.splitlines()
+        for ln in seg.splitlines()
         if ln.strip() and not ln.strip().startswith("//")
     ]
-    cmd = "\n".join(non_comment_lines).strip() if non_comment_lines else ""
-    low = cmd.lower()
+    return "\n".join(non_comment_lines).strip() if non_comment_lines else ""
 
+
+def _esql_should_drop_raw_logs_segment(
+    seg: str, agg_aliases: Optional[Iterable[str]] = None
+) -> bool:
+    """Drop eval date_trunc, stats, and post-aggregation threshold ``where``/``sort`` clauses."""
+    cmd = _esql_segment_command(seg)
     if not cmd:
         # Segment is only comments/whitespace.
         return True
+    low = cmd.lower()
+    aliases = [a for a in (agg_aliases or []) if a]
+
     if low.startswith("eval ") and "date_trunc" in low:
         return True
     if low.startswith("stats "):
@@ -2188,18 +2208,19 @@ def _esql_should_drop_raw_logs_segment(seg: str) -> bool:
             return True
         if re.search(r"\bfail_count\s*[><]=?\s*\d", low):
             return True
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", cmd, flags=re.IGNORECASE):
+                return True
+    if low.startswith("sort "):
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", cmd, flags=re.IGNORECASE):
+                return True
     return False
 
 
 def _esql_keep_strip_esql_fields(seg: str) -> Optional[str]:
     """Remove ``Esql.*`` field names from a ``keep`` command; ``None`` if nothing left."""
-    s = seg.strip()
-    non_comment_lines = [
-        ln.strip()
-        for ln in s.splitlines()
-        if ln.strip() and not ln.strip().startswith("//")
-    ]
-    cleaned_cmd = "\n".join(non_comment_lines).strip()
+    cleaned_cmd = _esql_segment_command(seg)
     m = re.match(r"(?i)^keep\s+(.+)$", cleaned_cmd, re.DOTALL)
     if not m:
         return seg
@@ -2293,20 +2314,30 @@ def _simplify_esql_for_raw_event_rows(
 ) -> Optional[Tuple[str, str]]:
     """Strip aggregation/threshold stages; narrow to entity on alert; keep row-level pipeline.
 
+    For ``STATS`` rules: keep only segments *before* ``STATS`` (row filters), drop the
+    aggregation and every post-``STATS`` ``WHERE``/``SORT`` that references metric
+    aliases (e.g. ``unique_ports``), then append an entity ``WHERE`` from ``BY`` fields.
+
     Returns ``(pipeline_string, entity_where_clause)`` or ``None``.
     """
     by_fields = _esql_stats_by_fields(esql)
+    agg_aliases = _esql_stats_metric_aliases(esql)
     entity = _esql_entity_where_clause(source, by_fields=by_fields)
 
     segments = _esql_split_pipeline(esql)
     if not segments:
         return None
 
+    is_agg = _esql_uses_aggregation(esql)
     out: List[str] = []
     for seg in segments:
-        if _esql_should_drop_raw_logs_segment(seg):
+        cmd = _esql_segment_command(seg)
+        low = cmd.lower()
+        # Aggregation rules: stop at STATS — post-STATS stages need metric columns.
+        if is_agg and low.startswith("stats "):
+            break
+        if _esql_should_drop_raw_logs_segment(seg, agg_aliases=agg_aliases):
             continue
-        low = seg.strip().lower()
         if low.startswith("keep "):
             cleaned = _esql_keep_strip_esql_fields(seg)
             if cleaned is None:
@@ -2316,7 +2347,7 @@ def _simplify_esql_for_raw_event_rows(
 
     # Apply entity narrowing only for aggregation-style detections.
     # For row-level/non-aggregated rules, forcing ``source.ip`` can be arbitrary.
-    if _esql_uses_aggregation(esql):
+    if is_agg:
         if not entity:
             _log().debug(
                 "ES|QL raw_logs: aggregation rule but no STATS BY fields found on alert values. "
@@ -2343,13 +2374,16 @@ def _append_esql_sort_and_limit(esql: str, limit: int) -> str:
     return f"{q}\n| SORT @timestamp ASC\n| LIMIT {int(limit)}"
 
 
-def _finalize_esql_raw_logs_query(esql: str) -> str:
+def _finalize_esql_raw_logs_query(
+    esql: str, agg_aliases: Optional[Iterable[str]] = None
+) -> str:
     """Hard cleanup pass to ensure aggregation-era clauses are removed.
 
     This is a safety net for multiline/comment-heavy ES|QL where segment parsing can miss
     a command boundary.
     """
     q = esql
+    aliases = [a for a in (agg_aliases or []) if a]
     # Remove any residual stats stage.
     q = re.sub(
         r"\|\s*stats\b[\s\S]*?(?=\n\s*\||\Z)",
@@ -2364,6 +2398,20 @@ def _finalize_esql_raw_logs_query(esql: str) -> str:
         q,
         flags=re.IGNORECASE,
     )
+    # Remove where/sort that still reference STATS metric aliases (e.g. unique_ports).
+    for alias in aliases:
+        q = re.sub(
+            rf"\|\s*where\b[\s\S]*?\b{re.escape(alias)}\b[\s\S]*?(?=\n\s*\||\Z)",
+            "",
+            q,
+            flags=re.IGNORECASE,
+        )
+        q = re.sub(
+            rf"\|\s*sort\b[\s\S]*?\b{re.escape(alias)}\b[\s\S]*?(?=\n\s*\||\Z)",
+            "",
+            q,
+            flags=re.IGNORECASE,
+        )
     # Remove explicit Esql.* projection lines if they survived in keep lists.
     q = re.sub(
         r"(?im)^\s*Esql\.[^,\n]*,?\s*$",
@@ -2575,7 +2623,9 @@ def _enrich_incident_with_esql_pipeline_raw_logs(
         return
     pipeline_body, entity_where = simplified
 
-    modified = _finalize_esql_raw_logs_query(pipeline_body)
+    modified = _finalize_esql_raw_logs_query(
+        pipeline_body, agg_aliases=_esql_stats_metric_aliases(base_esql)
+    )
     modified = _append_esql_sort_and_limit(modified, RAW_LOGS_FETCH_SIZE)
     time_filter = {
         "range": {

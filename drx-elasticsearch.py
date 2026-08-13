@@ -339,21 +339,23 @@ warnings.filterwarnings(
 # Constants
 # ---------------------------------------------------------------------------
 
-BASIC_AUTH = "Basic auth"
-BEARER_AUTH = "Bearer auth"
-API_KEY_AUTH = "API key auth"
+BASIC_AUTH = "BASIC_AUTH"
+BEARER_AUTH = "BEARER_AUTH"
+API_KEY_AUTH = "API_KEY_AUTH"
 API_KEY_PREFIX = "_api_key_id:"
 
-ELASTICSEARCH_V8 = "Elasticsearch_v8"
-ELASTICSEARCH_V9 = "Elasticsearch_v9"
-OPEN_SEARCH = "OpenSearch"
+# Values match Supabase ``configuration`` enums (same pattern as Gurucul flat keys).
+ELASTICSEARCH = "ELASTICSEARCH"
+ELASTICSEARCH_V8 = "ELASTICSEARCH_V8"
+ELASTICSEARCH_V9 = "ELASTICSEARCH_V9"
+OPEN_SEARCH = "OPEN_SEARCH"
 
 ES_DEFAULT_DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss.SSSSSS"
 PYTHON_DEFAULT_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
-SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
 
-supabase_api_key = Secret.load("supabase-api-key")
-SUPABASE_ANON_KEY = supabase_api_key.get()
+# Sync load — module-level ``await`` is invalid when Prefect imports this as a script.
+SUPABASE_URL = Secret.load("supabase-url").get()
+SUPABASE_ANON_KEY = Secret.load("supabase-api-key").get()
 
 # Same incident table as ``drx-securonix.insert_incident_row_in_supabase``.
 SUPABASE_DEV_TICKETS_TABLE = "dev_tickets"
@@ -393,7 +395,7 @@ FETCH_INDEX: str = ""
 FETCH_QUERY_PARM: str = ""
 RAW_QUERY: str = ""
 FETCH_TIME: str = "3 days"
-FETCH_SIZE: int = 50
+FETCH_SIZE: int = 20
 RAW_LOGS_FETCH_SIZE: int = 2
 INSECURE: bool = True
 TIME_METHOD: str = "Simple-Date"
@@ -505,12 +507,10 @@ def _init_globals_from_params(params: Dict[str, Any]) -> None:
     PARAMS = dict(params or {})
 
     AUTH_TYPE = PARAMS.get("auth_type", BASIC_AUTH)
-    credentials = PARAMS.get("credentials") or {}
-    USERNAME = credentials.get("identifier")
-    PASSWORD = credentials.get("password")
-    api_key_credentials = PARAMS.get("api_key_auth_credentials") or {}
-    API_KEY_ID = api_key_credentials.get("identifier")
-    API_KEY_SECRET = api_key_credentials.get("password")
+    USERNAME = PARAMS.get("credentials_identifier") or ""
+    PASSWORD = PARAMS.get("credentials_password") or ""
+    API_KEY_ID = PARAMS.get("api_key_auth_credentials_identifier") or ""
+    API_KEY_SECRET = PARAMS.get("api_key_auth_credentials_password") or ""
     API_KEY = None
 
     if AUTH_TYPE == BASIC_AUTH and USERNAME and USERNAME.startswith(API_KEY_PREFIX):
@@ -1125,12 +1125,12 @@ def verify_es_server_version(res):
             f"For more information please see the integration documentation."
         )
     if int(major_version) <= 7 and ELASTIC_SEARCH_CLIENT not in (
-        OPEN_SEARCH, "Elasticsearch"
+        OPEN_SEARCH, ELASTICSEARCH
     ):
         raise ValueError(
             f"Configuration Error: Your Elasticsearch server is version "
             f"{es_server_version}. Please ensure that the client type is set to "
-            f"Elasticsearch or {OPEN_SEARCH}. "
+            f"{ELASTICSEARCH} or {OPEN_SEARCH}. "
             f"For more information please see the integration documentation."
         )
 
@@ -2402,7 +2402,7 @@ def _perform_esql_json(
     """Run ES|QL via ``/_query``; requires Elasticsearch v8/v9 client."""
     if ELASTIC_SEARCH_CLIENT not in (ELASTICSEARCH_V8, ELASTICSEARCH_V9):
         raise DemistoException(
-            "ES|QL raw_logs enrichment requires client_type Elasticsearch_v8 or Elasticsearch_v9."
+            "ES|QL raw_logs enrichment requires client_type ELASTICSEARCH_V8 or ELASTICSEARCH_V9."
         )
     compatible_with = 8 if ELASTIC_SEARCH_CLIENT == ELASTICSEARCH_V8 else 9
     headers = {
@@ -3344,12 +3344,15 @@ def get_supabase_client() -> SupabaseClient:
 
 
 # Keys taken from Supabase ``configuration`` JSON; everything else stays local.
+# Field names match the DB payload (flat credentials, same style as Gurucul ``apikey``).
 SUPABASE_CONFIGURATION_KEYS = (
     "url",
     "client_type",
     "auth_type",
-    "credentials",
-    "api_key_auth_credentials",
+    "api_key_auth_credentials_identifier",
+    "api_key_auth_credentials_password",
+    "credentials_identifier",
+    "credentials_password",
     "fetch_time_field",
     "fetch_index",
     "fetch_query",
@@ -3366,8 +3369,10 @@ def _local_elastic_params(command: str) -> Dict[str, Any]:
         "url": "",
         "client_type": ELASTICSEARCH_V9,
         "auth_type": API_KEY_AUTH,
-        "credentials": {"identifier": "", "password": ""},
-        "api_key_auth_credentials": {"identifier": "", "password": ""},
+        "credentials_identifier": "",
+        "credentials_password": "",
+        "api_key_auth_credentials_identifier": "",
+        "api_key_auth_credentials_password": "",
         "insecure": True,
         "proxy": False,
         "fetch_time_field": "@timestamp",
@@ -3394,7 +3399,9 @@ def get_supabase_params(integration_id: int, command: str) -> Dict[str, Any]:
     """Merge local defaults with selected Supabase configuration + instance fields.
 
     From ``configuration`` JSON only:
-      url, client_type, auth_type, credentials, api_key_auth_credentials,
+      url, client_type, auth_type,
+      api_key_auth_credentials_identifier / api_key_auth_credentials_password,
+      credentials_identifier / credentials_password,
       fetch_time_field, fetch_index, fetch_query, raw_query, fetch_time,
       fetch_size, raw_logs_fetch_size
 
@@ -3439,7 +3446,9 @@ def get_supabase_params(integration_id: int, command: str) -> Dict[str, Any]:
 
     print(
         f"[params] supabase id={integration_id} "
-        f"url={params.get('url')!r} fetch_size={params.get('fetch_size')!r} "
+        f"url={params.get('url')!r} client_type={params.get('client_type')!r} "
+        f"auth_type={params.get('auth_type')!r} "
+        f"fetch_size={params.get('fetch_size')!r} "
         f"fetch_time={params.get('fetch_time')!r} "
         f"fetch_index={params.get('fetch_index')!r} "
         f"instance_name={params.get('instance_name')!r} "

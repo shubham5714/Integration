@@ -1217,19 +1217,24 @@ def incident_label_maker(source):
     return labels
 
 
-_INCIDENT_EXPORT_DEFAULTS: Dict[str, Any] = {
-    "instance_name": "Elastic",
-    "tenant_id": "d1708ffc-397e-43b6-8f0a-49306dcfc35d",
-    "tenant_name": "Embark Group",
-    "classifier": "test",
-    "mapper": "test",
-    "type": "elastic",
-    "alert_source": "/assets/images/brand-logos/elastic-logo.png",
-}
+def _export_defaults_from_params(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Ticket fields from params (tenant/instance branding comes from Supabase)."""
+    params = params or PARAMS or {}
+    return {
+        "instance_name": params.get("instance_name", ""),
+        "tenant_id": params.get("tenant_id", ""),
+        "tenant_name": params.get("tenant_name", ""),
+        "type": params.get("type", "default"),
+        "alert_source": params.get(
+            "alert_source", "/assets/images/brand-logos/elastic-logo.png"
+        ),
+    }
 
 
-def _finalize_incident_for_export(incident: Dict[str, Any]) -> None:
-    """Attach ``ai_message`` and default row fields before emit."""
+def _finalize_incident_for_export(
+    incident: Dict[str, Any], export_defaults: Optional[Dict[str, Any]] = None
+) -> None:
+    """Attach ``ai_message`` and param-driven export fields before emit."""
     logs = incident.get("raw_logs")
     first = logs[0] if isinstance(logs, list) and logs else ""
     incident["ai_message"] = json.dumps(
@@ -1241,7 +1246,8 @@ def _finalize_incident_for_export(incident: Dict[str, Any]) -> None:
         },
         default=str,
     )
-    for k, v in _INCIDENT_EXPORT_DEFAULTS.items():
+    defaults = export_defaults if export_defaults is not None else _export_defaults_from_params()
+    for k, v in defaults.items():
         incident.setdefault(k, v)
 
 
@@ -3337,48 +3343,109 @@ def get_supabase_client() -> SupabaseClient:
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 
+# Keys taken from Supabase ``configuration`` JSON; everything else stays local.
+SUPABASE_CONFIGURATION_KEYS = (
+    "url",
+    "client_type",
+    "auth_type",
+    "credentials",
+    "api_key_auth_credentials",
+    "fetch_time_field",
+    "fetch_index",
+    "fetch_query",
+    "raw_query",
+    "fetch_time",
+    "fetch_size",
+    "raw_logs_fetch_size",
+)
+
+
 def _local_elastic_params(command: str) -> Dict[str, Any]:
-    """Static integration params until Supabase configuration is merged in."""
+    """Local defaults. Supabase overlays fetch/auth keys and tenant/branding fields."""
     return {
-        "url": "https://embark-group-f2a75d.es.asia-south1.gcp.elastic.cloud:443",
+        "url": "",
         "client_type": ELASTICSEARCH_V9,
         "auth_type": API_KEY_AUTH,
         "credentials": {"identifier": "", "password": ""},
-        "api_key_auth_credentials": {"identifier": "5fGUwJ4BKNdGrSgn4vdI", "password": "9lgzlcVDUIIzRFr5wPiTHw"},
+        "api_key_auth_credentials": {"identifier": "", "password": ""},
         "insecure": True,
         "proxy": False,
         "fetch_time_field": "@timestamp",
         "fetch_index": ".alerts-security.alerts-default",
         "fetch_query": "*",
         "raw_query": "",
-        "fetch_time": "80 hour"
-        ,
-        "fetch_size": 5,
+        "fetch_time": "3 days",
+        "fetch_size": 50,
         "raw_logs_fetch_size": 5,
         "time_method": "Simple-Date",
         "timeout": 60,
         "map_labels": True,
+        # Export / dev_tickets defaults (tenant_id comes from Supabase instance row)
+        "instance_name": "",
+        "tenant_name": "",
+        "type": "default",
+        "alert_source": "/assets/images/brand-logos/elastic-logo.png",
         "isFetch": command == "fetch-incidents",
     }
 
 
 @task(log_prints=True)
 def get_supabase_params(integration_id: int, command: str) -> Dict[str, Any]:
-    """Verify instance exists in Supabase; return local static params for now."""
+    """Merge local defaults with selected Supabase configuration + instance fields.
+
+    From ``configuration`` JSON only:
+      url, client_type, auth_type, credentials, api_key_auth_credentials,
+      fetch_time_field, fetch_index, fetch_query, raw_query, fetch_time,
+      fetch_size, raw_logs_fetch_size
+
+    From instance row:
+      tenant_id, instance_name, tenant_name, logo → alert_source
+    """
     supabase = get_supabase_client()
     r = (
         supabase.table("integration_instances")
-        .select("configuration")
+        .select("configuration, tenant_id, instance_name, tenant_name, logo")
         .eq("id", integration_id)
         .limit(1)
         .execute()
     )
     if not r.data:
         raise ValueError(f"No integration instance with id={integration_id}")
-    cfg = r.data[0].get("configuration")
+
+    row = r.data[0]
+    cfg = row.get("configuration")
     if cfg is not None and not isinstance(cfg, dict):
         raise ValueError(f"Invalid configuration type for id={integration_id}")
-    return _local_elastic_params(command)
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    params = _local_elastic_params(command)
+
+    for key in SUPABASE_CONFIGURATION_KEYS:
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        if value is None or value == "":
+            continue
+        params[key] = value
+
+    if row.get("tenant_id") not in (None, ""):
+        params["tenant_id"] = row["tenant_id"]
+    if row.get("instance_name") not in (None, ""):
+        params["instance_name"] = row["instance_name"]
+    if row.get("tenant_name") not in (None, ""):
+        params["tenant_name"] = row["tenant_name"]
+    if row.get("logo") not in (None, ""):
+        params["alert_source"] = row["logo"]
+
+    print(
+        f"[params] supabase id={integration_id} "
+        f"url={params.get('url')!r} fetch_size={params.get('fetch_size')!r} "
+        f"fetch_time={params.get('fetch_time')!r} "
+        f"fetch_index={params.get('fetch_index')!r} "
+        f"instance_name={params.get('instance_name')!r} "
+        f"tenant_name={params.get('tenant_name')!r}"
+    )
+    return params
 
 
 @task(log_prints=True)
@@ -3465,7 +3532,7 @@ def insert_incident_row_in_supabase(incident: Dict[str, Any]) -> None:
 
 @flow(log_prints=True)
 def main(integration_id: int = None, command: str = None) -> RuntimeContext:
-    """Run the integration using Supabase-backed configuration only."""
+    """Run the integration using Supabase-backed params (merged with local defaults)."""
     if integration_id is None:
         raise ValueError(
             "Integration ID is required. Usage: main(integration_id=1, command='fetch-incidents')"

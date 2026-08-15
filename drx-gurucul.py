@@ -744,7 +744,7 @@ def fetch_incidents(
                 "occurred_at": _alert_detection_to_occurred_at(record.get("detectionTimestamp")),
                 "severity": map_severity_label(record.get("severity"), thresholds),
                 "source_id": str(alert_id),
-                "rawJSON": raw_payload,
+                "rawJSON": json.dumps(raw_payload),
                 "raw_logs": raw_logs,
             }
         )

@@ -360,10 +360,7 @@ SUPABASE_ANON_KEY = Secret.load("supabase-api-key").get()
 # Same incident table as ``drx-securonix.insert_incident_row_in_supabase``.
 SUPABASE_DEV_TICKETS_TABLE = "dev_tickets"
 # Fields kept in-memory for fetch/export but not persisted on insert.
-INCIDENT_FULL_EVENTS_KEY = "_full_events"
-SUPABASE_INCIDENT_INSERT_OMIT_KEYS = frozenset(
-    {"event_count", "rule_type", "query", INCIDENT_FULL_EVENTS_KEY}
-)
+SUPABASE_INCIDENT_INSERT_OMIT_KEYS = frozenset({"event_count", "rule_type", "query"})
 
 HTTP_ERRORS = {
     400: "400 Bad Request - Incorrect or invalid parameters",
@@ -1237,37 +1234,48 @@ def _export_defaults_from_params(params: Optional[Dict[str, Any]] = None) -> Dic
 RAWJSON_EVENTS_MAX = 5
 
 
-def _attach_raw_events_to_rawjson(
-    incident: Dict[str, Any], max_events: int = RAWJSON_EVENTS_MAX
-) -> None:
-    """Nest up to ``max_events`` full fetched events into ``rawJSON`` (Gurucul ``events``)."""
-    full = incident.get(INCIDENT_FULL_EVENTS_KEY)
-    events = full[:max_events] if isinstance(full, list) else []
+def _raw_log_value_from_event(event: Dict[str, Any]) -> Any:
+    """Return ``event.original``; if missing, the full event document."""
+    event_data = event.get("event")
+    if isinstance(event_data, dict):
+        original = event_data.get("original")
+        if original is not None and original != "":
+            return original
+    dotted = event.get("event.original")
+    if dotted is not None and dotted != "":
+        return dotted
+    return event
 
+
+def _attach_raw_events_to_rawjson(
+    incident: Dict[str, Any], events: List[Any], max_events: int = RAWJSON_EVENTS_MAX
+) -> None:
+    """Nest up to ``max_events`` full fetched events into ``rawJSON``."""
     raw_json = incident.get("rawJSON")
-    payload: Any
-    if isinstance(raw_json, str):
-        try:
-            payload = json.loads(raw_json)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            payload = {}
-    elif isinstance(raw_json, dict):
-        payload = dict(raw_json)
-    else:
+    try:
+        payload = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+    except (json.JSONDecodeError, TypeError, ValueError):
         payload = {}
     if not isinstance(payload, dict):
-        payload = {"value": payload}
-
-    payload["events"] = events
+        payload = {}
+    payload["events"] = events[:max_events]
     incident["rawJSON"] = json.dumps(payload, default=str)
 
 
 def _finalize_incident_for_export(
     incident: Dict[str, Any], export_defaults: Optional[Dict[str, Any]] = None
 ) -> None:
-    """Attach ``ai_message`` and param-driven export fields before emit."""
-    logs = incident.get("raw_logs")
-    first = logs[0] if isinstance(logs, list) and logs else ""
+    """Attach ``ai_message`` / ``rawJSON.events``, then reduce ``raw_logs`` to originals."""
+    full_events = incident.get("raw_logs")
+    if not isinstance(full_events, list):
+        full_events = []
+    _attach_raw_events_to_rawjson(incident, full_events)
+    originals = [
+        _raw_log_value_from_event(item) if isinstance(item, dict) else item
+        for item in full_events
+    ]
+    incident["raw_logs"] = originals
+    first = originals[0] if originals else ""
     incident["ai_message"] = json.dumps(
         {
             "name": incident.get("name"),
@@ -1277,7 +1285,6 @@ def _finalize_incident_for_export(
         },
         default=str,
     )
-    _attach_raw_events_to_rawjson(incident)
     defaults = export_defaults if export_defaults is not None else _export_defaults_from_params()
     for k, v in defaults.items():
         incident.setdefault(k, v)
@@ -1944,32 +1951,8 @@ def _build_threat_match_raw_logs_query(
     return indices, query_dsl, "ancestors_ids"
 
 
-def _raw_log_value_from_event(event: Dict[str, Any]) -> Any:
-    """Return ``event.original`` for ``raw_logs``; if missing, the full event document."""
-    event_data = event.get("event")
-    if isinstance(event_data, dict):
-        original = event_data.get("original")
-        if original is not None and original != "":
-            return original
-    dotted = event.get("event.original")
-    if dotted is not None and dotted != "":
-        return dotted
-    return event
-
-
-def _reset_raw_event_buffers(incident: Dict[str, Any]) -> None:
-    incident["raw_logs"] = []
-    incident[INCIDENT_FULL_EVENTS_KEY] = []
-
-
-def _record_fetched_event(incident: Dict[str, Any], event: Dict[str, Any]) -> None:
-    """Keep the full event for ``rawJSON`` and ``event.original`` for ``raw_logs``."""
-    incident.setdefault(INCIDENT_FULL_EVENTS_KEY, []).append(event)
-    incident.setdefault("raw_logs", []).append(_raw_log_value_from_event(event))
-
-
 def _append_raw_logs_from_hits(incident: Dict[str, Any], hits: Any) -> None:
-    """Record each hit's full ``_source`` and its ``event.original`` (or full event)."""
+    """Append each hit's full ``_source`` event; export later splits originals vs ``rawJSON``."""
     if not isinstance(hits, list):
         return
     for raw_hit in hits:
@@ -1977,7 +1960,7 @@ def _append_raw_logs_from_hits(incident: Dict[str, Any], hits: Any) -> None:
             continue
         raw_source = raw_hit.get("_source")
         if isinstance(raw_source, dict):
-            _record_fetched_event(incident, raw_source)
+            incident["raw_logs"].append(raw_source)
 
 
 def _enrich_incident_with_query_rule_raw_logs(
@@ -1993,7 +1976,7 @@ def _enrich_incident_with_query_rule_raw_logs(
         return
 
     indices, query_dsl, fetch_method = payload
-    _reset_raw_event_buffers(incident)
+    incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
     _raw_logs_info("execute", "query", fetch_method, incident, query=query_dsl, indices=indices)
     try:
@@ -2037,7 +2020,7 @@ def _enrich_incident_with_new_terms_raw_logs(
         return
 
     indices, query_dsl, fetch_method = payload
-    _reset_raw_event_buffers(incident)
+    incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
     _raw_logs_info("execute", "new_terms", fetch_method, incident, query=query_dsl, indices=indices)
     try:
@@ -2081,7 +2064,7 @@ def _enrich_incident_with_eql_rule_raw_logs(
         return
 
     indices, query_dsl, fetch_method = payload
-    _reset_raw_event_buffers(incident)
+    incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
     _raw_logs_info("execute", "eql", fetch_method, incident, query=query_dsl, indices=indices)
     try:
@@ -2125,7 +2108,7 @@ def _enrich_incident_with_threat_match_raw_logs(
         return
 
     indices, query_dsl, fetch_method = payload
-    _reset_raw_event_buffers(incident)
+    incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
     _raw_logs_info("execute", "threat_match", fetch_method, incident, query=query_dsl, indices=indices)
     try:
@@ -2580,7 +2563,7 @@ def _enrich_incident_with_esql_raw_logs(
     ancestors_payload = _build_esql_raw_logs_ancestors_query(source)
     if ancestors_payload is not None:
         indices, query_dsl, fetch_method = ancestors_payload
-        _reset_raw_event_buffers(incident)
+        incident["raw_logs"] = []
         incident["query"] = _incident_query_json_string(query_dsl)
         _raw_logs_info("execute", "esql", fetch_method, incident, query=query_dsl, indices=indices)
         try:
@@ -2617,7 +2600,7 @@ def _enrich_incident_with_esql_raw_logs(
             )
 
         incident.pop("raw_logs_error", None)
-        _reset_raw_event_buffers(incident)
+        incident["raw_logs"] = []
 
     _enrich_incident_with_esql_pipeline_raw_logs(incident, es, source)
 
@@ -2680,7 +2663,7 @@ def _enrich_incident_with_esql_pipeline_raw_logs(
     if entity_where:
         query_record["entity_where"] = entity_where
     incident["query"] = _incident_query_json_string(query_record)
-    _reset_raw_event_buffers(incident)
+    incident["raw_logs"] = []
 
     fetch_method = "esql_post_query"
     _raw_logs_info(
@@ -2698,10 +2681,7 @@ def _enrich_incident_with_esql_pipeline_raw_logs(
             raise DemistoException(str(payload.get("error")))
         rows = _esql_json_to_row_dicts(payload)
         for row in rows[:RAW_LOGS_FETCH_SIZE]:
-            if isinstance(row, dict):
-                _record_fetched_event(incident, row)
-            else:
-                incident.setdefault("raw_logs", []).append(row)
+            incident["raw_logs"].append(row)
         n_raw = len(incident["raw_logs"])
         _raw_logs_info(
             "done",
@@ -2820,7 +2800,7 @@ def _enrich_incident_with_threshold_raw_logs(
         return
 
     indices, query_dsl, fetch_method = query_payload
-    _reset_raw_event_buffers(incident)
+    incident["raw_logs"] = []
     incident["query"] = _incident_query_json_string(query_dsl)
     _raw_logs_info("execute", "threshold", fetch_method, incident, query=query_dsl, indices=indices)
     _log().debug(

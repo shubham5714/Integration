@@ -1420,9 +1420,41 @@ def _extract_threshold_query_filters(rule_filters: Any) -> List[Dict[str, Any]]:
     return filters
 
 
+def _escape_colons_in_kql_quoted_values(query: str) -> str:
+    """Escape ``:`` inside KQL double-quoted values (e.g. ``https\\://...``).
+
+    Unquoted ``:`` is the KQL field operator. URLs inside quotes still break some
+    parsers unless the colon is escaped. Existing ``\\:`` sequences are left as-is.
+    """
+    out: List[str] = []
+    in_quote = False
+    i = 0
+    n = len(query)
+    while i < n:
+        ch = query[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(query[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            out.append(ch)
+            i += 1
+            continue
+        if in_quote and ch == ":":
+            out.append("\\:")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _rule_query_dsl_clause(rule_query: Any) -> Dict[str, Any]:
     """Kibana rule query text as Elasticsearch ``kql`` query DSL."""
-    return {"kql": {"query": str(rule_query).strip()}}
+    query = _escape_colons_in_kql_quoted_values(str(rule_query).strip())
+    return {"kql": {"query": query}}
 
 
 def _bool_query_with_rule_text(rule_query: Any, filter_clauses: Any) -> Dict[str, Any]:

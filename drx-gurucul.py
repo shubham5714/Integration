@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import traceback
 from dataclasses import dataclass
 import dataclasses as _dc
@@ -576,38 +577,63 @@ def _strip_empty_string_fields(value: Any) -> Any:
     return value
 
 
+def _parse_big_data_events(response: Any) -> list:
+    if isinstance(response, dict):
+        result = response.get("Result") or []
+        events = result if isinstance(result, list) else [result]
+    elif isinstance(response, list):
+        events = response
+    else:
+        events = []
+    return _strip_empty_string_fields(events)
+
+
 def fetch_alert_raw_logs(
     client: Client, alert_id: Any, max_events: int = 25
 ) -> list:
-    """Fetch big-data events for an alert via ``/v1/searchBigDataEvents``."""
-    try:
-        headers = dict(client._headers or {})
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-        headers["Accept"] = "application/json"
-        response = client._http_request(
-            method="POST",
-            url_suffix="/v1/searchBigDataEvents",
-            data={
-                "expression": f'gra.alertid = "AL-{alert_id}"',
-                "page": "1",
-                "max": str(max_events),
-            },
-            headers=headers,
-            resp_type="json",
-        )
-        if isinstance(response, dict):
-            result = response.get("Result") or []
-            events = result if isinstance(result, list) else [result]
-        elif isinstance(response, list):
-            events = response
-        else:
-            events = []
-        return _strip_empty_string_fields(events)
-    except Exception:
-        _log().error(
-            f"Unable to fetch raw logs for alertId={alert_id}: {traceback.format_exc()}"
-        )
-    return []
+    """Fetch big-data events for an alert via ``/v1/searchBigDataEvents``.
+
+    Retries once if the first attempt returns no events (empty Result or request error).
+    """
+    headers = dict(client._headers or {})
+    headers["Content-Type"] = "application/x-www-form-urlencoded"
+    headers["Accept"] = "application/json"
+
+    def _once(attempt: int) -> list:
+        try:
+            response = client._http_request(
+                method="POST",
+                url_suffix="/v1/searchBigDataEvents",
+                data={
+                    "expression": f'gra.alertid = "AL-{alert_id}"',
+                    "page": "1",
+                    "max": str(max_events),
+                },
+                headers=headers,
+                resp_type="json",
+            )
+            events = _parse_big_data_events(response)
+            if not events:
+                print(
+                    f"[raw_logs] alertId={alert_id} attempt={attempt} empty Result "
+                    f"response={response!r}"
+                )
+            return events
+        except Exception:
+            err = traceback.format_exc()
+            print(f"[raw_logs] alertId={alert_id} attempt={attempt} error:\n{err}")
+            _log().error(f"Unable to fetch raw logs for alertId={alert_id}: {err}")
+            return []
+
+    events = _once(attempt=1)
+    if events:
+        return events
+    print(f"[raw_logs] alertId={alert_id} events=0 — retrying once")
+    time.sleep(2)
+    events = _once(attempt=2)
+    if not events:
+        print(f"[raw_logs] alertId={alert_id} still 0 events after retry — continuing")
+    return events
 
 
 @task(log_prints=True)

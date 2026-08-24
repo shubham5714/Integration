@@ -324,8 +324,8 @@ urllib3.disable_warnings()
 
 MAX_INCIDENTS_TO_FETCH = 25
 API_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
-
+#SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
+SUPABASE_URL = Secret.load("supabase-url").get()
 # Sync load — module-level ``await`` is invalid when Prefect imports this as a script.
 supabase_api_key = Secret.load("supabase-api-key")
 SUPABASE_ANON_KEY = supabase_api_key.get()

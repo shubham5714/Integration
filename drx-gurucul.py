@@ -1571,7 +1571,7 @@ def main(
                 )
             )
 
-        elif cmd == "gra-health-check":
+        elif cmd == "health-check":
             summary = gra_health_check_command(
                 client, instance_id=integration_id, params=params
             )
@@ -1772,6 +1772,7 @@ def main(
             fetch_records(client, anomaliesUrl, "Gra.Cases.anomalies", "caseId", page_params)
 
         else:
+            print(f"[main] Unknown command: {cmd!r} — nothing executed")
             runtime_ctx.output.emit_error(f"Unknown command: {cmd!r}", raise_after=False)
 
     except IntegrationError:
@@ -1798,7 +1799,7 @@ def main(
 if __name__ in ("__main__", "__builtin__", "builtins"):
     try:
         integration_id = 59  # Change this to your integration ID
-        command = "gra-health-check"  # Change to "test-module" or other supported command
+        command = "health-check"  # Change to "test-module" or other supported command
 
         ctx = main(integration_id=integration_id, command=command)
         print(json.dumps(ctx.snapshot(), default=str, indent=2))

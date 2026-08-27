@@ -324,13 +324,22 @@ urllib3.disable_warnings()
 
 MAX_INCIDENTS_TO_FETCH = 25
 API_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-#SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
-SUPABASE_URL = Secret.load("supabase-url").get()
+SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
+
 # Sync load — module-level ``await`` is invalid when Prefect imports this as a script.
-supabase_api_key = Secret.load("supabase-api-key")
-SUPABASE_ANON_KEY = supabase_api_key.get()
+try:
+    supabase_api_key = Secret.load("supabase-api-key")
+    SUPABASE_ANON_KEY = supabase_api_key.get()
+except Exception:
+    SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+    if not SUPABASE_ANON_KEY:
+        raise RuntimeError(
+            "Prefect Secret 'supabase-api-key' not found. "
+            "Set env SUPABASE_ANON_KEY for local runs."
+        )
 
 SUPABASE_DEV_TICKETS_TABLE = "dev_tickets"
+SUPABASE_INSTANCE_HEALTH_CHECKS_TABLE = "instance_health_checks"
 
 _runtime: Optional[RuntimeContext] = None
 
@@ -471,6 +480,75 @@ def _format_api_datetime(dt: datetime) -> str:
     return dt.strftime(API_DATE_FORMAT)
 
 
+def _coerce_api_datetime(value: Any) -> str | None:
+    """Normalize a date/time arg to ``YYYY-MM-DD HH:MM:SS`` UTC, or None if empty."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return _format_api_datetime(value)
+    if isinstance(value, (int, float)):
+        return _format_api_datetime(datetime.fromtimestamp(int(value), tz=timezone.utc))
+    text = str(value).strip()
+    if not text:
+        return None
+    # Already GRA-shaped — keep as-is.
+    try:
+        datetime.strptime(text, API_DATE_FORMAT)
+        return text
+    except ValueError:
+        pass
+    parsed = dateparser.parse(text, settings={"TIMEZONE": "UTC", "RETURN_AS_TIMEZONE_AWARE": True})
+    if parsed is None:
+        raise ValueError(f"Invalid datetime: {value!r}")
+    return _format_api_datetime(parsed)
+
+
+def resolve_search_time_window(
+    *,
+    from_date: Any = None,
+    to_date: Any = None,
+    period: Any = None,
+    default_period: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve ``eventFromDate``/``eventToDate`` for searchBigDataEvents.
+
+    Priority:
+      1. Explicit from_date / to_date (aliases: fromDate, startDate, eventFromDate, …)
+      2. Relative ``period`` (e.g. ``1 hour``) ending at now
+      3. ``default_period`` when neither explicit dates nor period are set
+    """
+    from_s = _coerce_api_datetime(from_date)
+    to_s = _coerce_api_datetime(to_date)
+    if from_s or to_s:
+        if from_s and not to_s:
+            to_s = _format_api_datetime(datetime.now(timezone.utc))
+        return from_s, to_s
+
+    rel = (str(period).strip() if period not in (None, "") else None) or default_period
+    if not rel:
+        return None, None
+
+    now = datetime.now(timezone.utc)
+    rel_text = rel if "ago" in rel.lower() else f"{rel} ago"
+    start = dateparser.parse(
+        rel_text,
+        settings={
+            "TIMEZONE": "UTC",
+            "RETURN_AS_TIMEZONE_AWARE": True,
+            "RELATIVE_BASE": now,
+        },
+    )
+    if start is None:
+        raise ValueError(f"Invalid period: {rel!r}")
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    else:
+        start = start.astimezone(timezone.utc)
+    if start > now:
+        start = now - (start - now)
+    return _format_api_datetime(start), _format_api_datetime(now)
+
+
 def _parse_alert_detection(detection_timestamp: Any) -> datetime | None:
     """Parse GRA ``detectionTimestamp`` (e.g. ``07/21/2026 18:04:38``) as UTC-aware datetime."""
     if detection_timestamp is None or detection_timestamp == "":
@@ -551,15 +629,12 @@ def _finalize_incident_for_export(
     """Attach ``ai_message`` and param-driven export fields before insert."""
     logs = incident.get("raw_logs")
     first = logs[0] if isinstance(logs, list) and logs else ""
-    incident["ai_message"] = json.dumps(
-        {
-            "name": incident.get("name"),
-            "severity": incident.get("severity"),
-            "occurred_at": incident.get("occurred_at"),
-            "raw_log": first,
-        },
-        default=str,
-    )
+    incident["ai_message"] = {
+        "name": incident.get("name"),
+        "severity": incident.get("severity"),
+        "occurred_at": incident.get("occurred_at"),
+        "raw_log": first,
+    }
     for key, value in export_defaults.items():
         incident.setdefault(key, value)
 
@@ -588,52 +663,471 @@ def _parse_big_data_events(response: Any) -> list:
     return _strip_empty_string_fields(events)
 
 
-def fetch_alert_raw_logs(
-    client: Client, alert_id: Any, max_events: int = 25
+def search_big_data_events(
+    client: Client,
+    expression: str,
+    page: int = 1,
+    max_events: int = 100,
+    *,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    retries: int = 1,
+    retry_delay_sec: float = 2.0,
+    log_prefix: str = "[search]",
 ) -> list:
-    """Fetch big-data events for an alert via ``/v1/searchBigDataEvents``.
+    """POST ``/v1/searchBigDataEvents`` with a GRA expression.
 
-    Retries once if the first attempt returns no events (empty Result or request error).
+    Optional ``from_date`` / ``to_date`` (``YYYY-MM-DD HH:MM:SS``) are sent as
+    ``eventFromDate`` / ``eventToDate``.
+    Retries when the first attempt returns no events (empty Result or request error).
     """
+    expression = (expression or "").strip()
+    if not expression:
+        raise ValueError("expression/query is required")
+
     headers = dict(client._headers or {})
     headers["Content-Type"] = "application/x-www-form-urlencoded"
     headers["Accept"] = "application/json"
+    page = max(1, int(page))
+    max_events = max(1, min(int(max_events), 500))
+    attempts = max(1, int(retries) + 1)
+
+    form: Dict[str, str] = {
+        "expression": expression,
+        "page": str(page),
+        "max": str(max_events),
+    }
+    if from_date:
+        form["eventFromDate"] = from_date
+    if to_date:
+        form["eventToDate"] = to_date
+    print(
+        f"{log_prefix} expression={expression!r} page={page} max={max_events} "
+        f"eventFromDate={form.get('eventFromDate')!r} "
+        f"eventToDate={form.get('eventToDate')!r}"
+    )
 
     def _once(attempt: int) -> list:
         try:
             response = client._http_request(
                 method="POST",
                 url_suffix="/v1/searchBigDataEvents",
-                data={
-                    "expression": f'gra.alertid = "AL-{alert_id}"',
-                    "page": "1",
-                    "max": str(max_events),
-                },
+                data=form,
                 headers=headers,
                 resp_type="json",
             )
             events = _parse_big_data_events(response)
             if not events:
                 print(
-                    f"[raw_logs] alertId={alert_id} attempt={attempt} empty Result "
-                    f"response={response!r}"
+                    f"{log_prefix} attempt={attempt} empty Result "
+                    f"expression={expression!r} response={response!r}"
                 )
             return events
         except Exception:
             err = traceback.format_exc()
-            print(f"[raw_logs] alertId={alert_id} attempt={attempt} error:\n{err}")
-            _log().error(f"Unable to fetch raw logs for alertId={alert_id}: {err}")
+            print(f"{log_prefix} attempt={attempt} error:\n{err}")
+            _log().error(f"Unable to searchBigDataEvents expression={expression!r}: {err}")
             return []
 
     events = _once(attempt=1)
-    if events:
-        return events
-    print(f"[raw_logs] alertId={alert_id} events=0 — retrying once")
-    time.sleep(2)
-    events = _once(attempt=2)
+    for attempt in range(2, attempts + 1):
+        if events:
+            break
+        print(f"{log_prefix} events=0 — retrying (attempt {attempt}/{attempts})")
+        time.sleep(retry_delay_sec)
+        events = _once(attempt=attempt)
     if not events:
-        print(f"[raw_logs] alertId={alert_id} still 0 events after retry — continuing")
+        print(f"{log_prefix} still 0 events after {attempts} attempt(s) — continuing")
     return events
+
+
+def fetch_alert_raw_logs(
+    client: Client, alert_id: Any, max_events: int = 25
+) -> list:
+    """Fetch big-data events for an alert via ``search_big_data_events``."""
+    return search_big_data_events(
+        client,
+        expression=f'gra.alertid = "AL-{alert_id}"',
+        page=1,
+        max_events=max_events,
+        retries=1,
+        log_prefix=f"[raw_logs] alertId={alert_id}",
+    )
+
+
+def gra_search_command(
+    client: Client,
+    arguments: Dict[str, Any],
+) -> list:
+    """Run ``gra-search``: execute a GRA expression and return Result rows.
+
+    Time window args (optional):
+      - ``eventFromDate`` / ``eventToDate`` (also ``fromDate`` / ``toDate`` / ``startDate`` / ``endDate``)
+      - or relative ``period`` (e.g. ``1 hour``, ``24 hours``)
+    """
+    expression = arguments.get("query") or arguments.get("expression")
+    if not expression:
+        raise ValueError("gra-search requires args.query (or args.expression)")
+    page = arg_to_int(arg=arguments.get("page"), arg_name="page", required=False) or 1
+    max_events = (
+        arg_to_int(arg=arguments.get("max"), arg_name="max", required=False) or 100
+    )
+    from_date, to_date = resolve_search_time_window(
+        from_date=arguments.get("eventFromDate")
+        or arguments.get("fromDate")
+        or arguments.get("startDate"),
+        to_date=arguments.get("eventToDate")
+        or arguments.get("toDate")
+        or arguments.get("endDate"),
+        period=arguments.get("period"),
+    )
+    print(
+        f"[gra-search] expression={expression!r} page={page} max={max_events} "
+        f"eventFromDate={from_date!r} eventToDate={to_date!r}"
+    )
+    events = search_big_data_events(
+        client,
+        expression=str(expression),
+        page=page,
+        max_events=max_events,
+        from_date=from_date,
+        to_date=to_date,
+        retries=1,
+        log_prefix="[gra-search]",
+    )
+    print(f"[gra-search] result_count={len(events)}")
+    return events
+
+
+def _normalize_health_items(items: Any) -> list[dict[str, str]]:
+    """Coerce ``health_check_list`` / ``items`` into ``[{type, value, severity}, ...]``.
+
+    Accepts:
+      - ``[{"type": "Firewall", "value": "HOST", "severity": "High"}, ...]``
+      - ``["HOST", ...]`` / CSV string (type/severity default empty)
+    """
+    if items is None:
+        return []
+    if isinstance(items, str):
+        text = items.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            items = parsed
+        except json.JSONDecodeError:
+            return [
+                {"type": "", "value": part.strip(), "severity": ""}
+                for part in text.split(",")
+                if part.strip()
+            ]
+
+    if not isinstance(items, (list, tuple, set)):
+        items = [items]
+
+    normalized: list[dict[str, str]] = []
+    for entry in items:
+        if isinstance(entry, dict):
+            value = entry.get("value")
+            if value in (None, ""):
+                value = entry.get("hostname") or entry.get("name") or entry.get("item")
+            if value in (None, ""):
+                continue
+            item_type = entry.get("type") or entry.get("item_type") or ""
+            severity = entry.get("severity") or ""
+            normalized.append(
+                {
+                    "type": str(item_type).strip(),
+                    "value": str(value).strip(),
+                    "severity": str(severity).strip(),
+                }
+            )
+        else:
+            text = str(entry).strip()
+            if text:
+                normalized.append({"type": "", "value": text, "severity": ""})
+    return normalized
+
+
+def _health_check_ticket_row(
+    *,
+    item: dict[str, str],
+    instance_name: str,
+    tenant_id: Any,
+    health_check_id: Any = None,
+) -> Dict[str, Any]:
+    """Build a ``dev_tickets`` row for a missing health-check item."""
+    value = item.get("value") or ""
+    item_type = item.get("type") or "device"
+    severity = item.get("severity") or "High"
+    now_utc = datetime.now(timezone.utc)
+    occurred_at = now_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    created_at = occurred_at
+    name = f"Log Stoppage | {value}- {item_type} | {instance_name}"
+    message = f"log stoppage observed for this {item_type}: {value}"
+    raw_logs = [
+        {
+            "item": value,
+            "type": item_type,
+            "instance_name": instance_name,
+            "message": message,
+        }
+    ]
+    payload = {
+        "name": name,
+        "severity": severity,
+        "events": raw_logs,
+    }
+    return {
+        "name": name,
+        "severity": severity,
+        "raw_logs": raw_logs,
+        "created_at": created_at,
+        "occurred_at": occurred_at,
+        "instance_name": instance_name,
+        "rawJSON": payload,
+        "ai_message": payload,
+        "tenant_id": tenant_id if tenant_id not in (None, "") else "",
+        "log_source": "Health Check",
+        "alert_source": "/assets/images/brand-logos/desktop-dark-2.png",
+        "source_id": "",
+        "type": "health-check",
+        "health_check_id": health_check_id,
+    }
+
+
+def _match_key(value: Any) -> str:
+    """Case-insensitive key used to compare expected items vs Result values."""
+    return str(value).strip().casefold()
+
+
+def _values_from_search_result(events: list, match_field: str) -> dict[str, str]:
+    """Map normalized match keys → original Result values for ``match_field``."""
+    found: dict[str, str] = {}
+    for row in events:
+        raw: Any = None
+        if isinstance(row, dict):
+            if match_field in row and row[match_field] not in (None, ""):
+                raw = row[match_field]
+            elif len(row) == 1:
+                only = next(iter(row.values()))
+                if only not in (None, ""):
+                    raw = only
+        elif row not in (None, ""):
+            raw = row
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            found[_match_key(text)] = text
+    return found
+
+
+@task(log_prints=True)
+def get_instance_health_checks(instance_id: int) -> list[dict[str, Any]]:
+    """Load rows from ``instance_health_checks`` for an integration instance."""
+    supabase = get_supabase_client()
+    r = (
+        supabase.table(SUPABASE_INSTANCE_HEALTH_CHECKS_TABLE)
+        .select("*")
+        .eq("instance_id", instance_id)
+        .execute()
+    )
+    rows = [row for row in (r.data or []) if isinstance(row, dict)]
+    # Prefer enabled rows when column exists; keep all if column absent.
+    enabled_rows = [row for row in rows if row.get("enabled") is not False]
+    print(
+        f"[health-check] instance_id={instance_id} "
+        f"rows={len(rows)} enabled={len(enabled_rows)}"
+    )
+    return enabled_rows
+
+
+@task(log_prints=True)
+def gra_health_check_command(
+    client: Client,
+    instance_id: int,
+    params: Optional[Dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Run configured health checks: query GRA and flag missing expected items.
+
+    For each ``instance_health_checks`` row:
+      - run ``query`` via ``search_big_data_events``
+      - compare ``health_check_list`` (or ``items``) against Result values of ``match_field``
+      - print stoppage for each missing item and insert a ``dev_tickets`` row
+    """
+    params = params or {}
+    instance_name = str(params.get("instance_name") or f"instance-{instance_id}")
+    checks = get_instance_health_checks(instance_id)
+    summary: dict[str, Any] = {
+        "instance_id": instance_id,
+        "checks": [],
+        "missing_total": 0,
+        "tickets_inserted": 0,
+    }
+    if not checks:
+        print(f"[health-check] no rows in {SUPABASE_INSTANCE_HEALTH_CHECKS_TABLE}")
+        return summary
+
+    for check in checks:
+        check_id = check.get("id")
+        check_name = check.get("name") or check.get("check_name") or f"check-{check_id}"
+        query = check.get("query") or ""
+        match_field = str(check.get("match_field") or "hostname").strip() or "hostname"
+        default_item_label = str(check.get("item_label") or "device").strip() or "device"
+        tenant_id = check.get("tenant_id")
+        if tenant_id in (None, ""):
+            tenant_id = params.get("tenant_id", "")
+        expected_items = _normalize_health_items(
+            check.get("health_check_list")
+            if check.get("health_check_list") not in (None, "")
+            else check.get("items")
+        )
+        expected_values = [item["value"] for item in expected_items]
+        page = arg_to_int(arg=check.get("page"), arg_name="page", required=False) or 1
+        max_events = (
+            arg_to_int(arg=check.get("max"), arg_name="max", required=False) or 100
+        )
+        from_date, to_date = resolve_search_time_window(
+            from_date=check.get("eventFromDate")
+            or check.get("fromDate")
+            or check.get("from_date")
+            or check.get("startDate"),
+            to_date=check.get("eventToDate")
+            or check.get("toDate")
+            or check.get("to_date")
+            or check.get("endDate"),
+            period=check.get("period"),
+            default_period="1 hour",
+        )
+
+        print(
+            f"[health-check] start name={check_name!r} id={check_id} "
+            f"match_field={match_field!r} expected={len(expected_items)} "
+            f"eventFromDate={from_date!r} eventToDate={to_date!r} query={query!r}"
+        )
+        if not query:
+            print(f"[health-check] skip name={check_name!r} — empty query")
+            summary["checks"].append(
+                {
+                    "id": check_id,
+                    "name": check_name,
+                    "status": "skipped",
+                    "reason": "empty query",
+                    "missing": [],
+                }
+            )
+            continue
+
+        events = search_big_data_events(
+            client,
+            expression=str(query),
+            page=page,
+            max_events=max_events,
+            from_date=from_date,
+            to_date=to_date,
+            retries=1,
+            log_prefix=f"[health-check] name={check_name!r}",
+        )
+        found_map = _values_from_search_result(events, match_field)
+        found_keys = set(found_map.keys())
+        found_values = sorted(found_map.values(), key=str.casefold)
+        missing_items = [
+            item
+            for item in expected_items
+            if _match_key(item["value"]) not in found_keys
+        ]
+        matched_items = [
+            item
+            for item in expected_items
+            if _match_key(item["value"]) in found_keys
+        ]
+        expected_keys = {_match_key(v) for v in expected_values}
+        extra = [
+            value
+            for key, value in found_map.items()
+            if key not in expected_keys
+        ]
+
+        print(
+            f"[health-check] Result ({len(events)} row(s)) for "
+            f"match_field={match_field!r}:\n"
+            f"{json.dumps(events, default=str, indent=2)}"
+        )
+        print(
+            f"[health-check] extracted {match_field} values "
+            f"({len(found_values)}): {found_values}"
+        )
+        print(
+            f"[health-check] expected values ({len(expected_values)}): {expected_values}"
+        )
+        if extra:
+            print(
+                f"[health-check] in Result but not in health_check_list "
+                f"({len(extra)}): {extra}"
+            )
+
+        tickets_for_check = 0
+        for item in missing_items:
+            label = item["type"] or default_item_label
+            print(
+                f"[health-check] log stoppage observed for this {label}: {item['value']} "
+                f"severity={item.get('severity')!r} (check={check_name!r})"
+            )
+            ticket = _health_check_ticket_row(
+                item=item,
+                instance_name=instance_name,
+                tenant_id=tenant_id,
+                health_check_id=check_id,
+            )
+            print(
+                f"[health-check] inserting ticket name={ticket['name']!r} "
+                f"severity={ticket['severity']!r}"
+            )
+            insert_incident_row_in_supabase(ticket)
+            tickets_for_check += 1
+            summary["tickets_inserted"] += 1
+
+        for item in matched_items:
+            label = item["type"] or default_item_label
+            api_value = found_map[_match_key(item["value"])]
+            note = f" (api={api_value!r})" if api_value != item["value"] else ""
+            print(
+                f"[health-check] ok {label}={item['value']}{note} "
+                f"(check={check_name!r})"
+            )
+
+        print(
+            f"[health-check] done name={check_name!r} "
+            f"result_count={len(events)} found={len(matched_items)} "
+            f"missing={len(missing_items)} tickets={tickets_for_check}"
+        )
+        summary["missing_total"] += len(missing_items)
+        summary["checks"].append(
+            {
+                "id": check_id,
+                "name": check_name,
+                "status": "ok" if not missing_items else "stoppage",
+                "match_field": match_field,
+                "eventFromDate": from_date,
+                "eventToDate": to_date,
+                "expected_count": len(expected_items),
+                "found_count": len(matched_items),
+                "result_count": len(events),
+                "result": events,
+                "found_values": found_values,
+                "missing": missing_items,
+                "extra": extra,
+                "tickets_inserted": tickets_for_check,
+            }
+        )
+
+    print(
+        f"[health-check] complete instance_id={instance_id} "
+        f"checks={len(summary['checks'])} missing_total={summary['missing_total']} "
+        f"tickets_inserted={summary['tickets_inserted']}"
+    )
+    return summary
 
 
 @task(log_prints=True)
@@ -936,6 +1430,24 @@ def update_last_run_in_supabase(integration_id: int, last_run: Dict[str, Any]) -
     ).execute()
 
 
+def _as_jsonb(value: Any, *, empty: Any = None) -> Any:
+    """Ensure a value is a JSON-serializable object for jsonb columns (not a string)."""
+    if value is None:
+        return empty
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return empty
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return value
+        return parsed
+    return value
+
+
 @task(log_prints=True)
 def insert_incident_row_in_supabase(incident: Dict[str, Any]) -> None:
     """Insert a single fetched incident into Supabase (``dev_tickets``)."""
@@ -944,14 +1456,13 @@ def insert_incident_row_in_supabase(incident: Dict[str, Any]) -> None:
         _log().warning("Supabase client unavailable; skipping incident insert.")
         return
     row = dict(incident)
+    row["raw_logs"] = _as_jsonb(row.get("raw_logs"), empty=[])
+    row["rawJSON"] = _as_jsonb(row.get("rawJSON"), empty={})
+    row["ai_message"] = _as_jsonb(row.get("ai_message"), empty={})
     raw_logs = row.get("raw_logs")
     raw_logs_count = len(raw_logs) if isinstance(raw_logs, list) else (
-        "json" if isinstance(raw_logs, str) else 0
+        "object" if isinstance(raw_logs, dict) else 0
     )
-    if isinstance(raw_logs, list):
-        row["raw_logs"] = json.dumps(raw_logs, default=str)
-    elif raw_logs is None:
-        row["raw_logs"] = json.dumps([], default=str)
     print(
         f"[insert] inserting source_id={row.get('source_id')!r} "
         f"name={row.get('name')!r} occurred_at={row.get('occurred_at')!r} "
@@ -1048,6 +1559,30 @@ def main(
                 return_results(result)
             except Exception:
                 return_error("Error in service")
+
+        elif cmd == "gra-search":
+            events = gra_search_command(client, arguments)
+            return_results(
+                CommandResults(
+                    outputs_prefix="Gra.Search",
+                    outputs_key_field="",
+                    outputs=events,
+                    raw_response=events,
+                )
+            )
+
+        elif cmd == "gra-health-check":
+            summary = gra_health_check_command(
+                client, instance_id=integration_id, params=params
+            )
+            return_results(
+                CommandResults(
+                    outputs_prefix="Gra.HealthCheck",
+                    outputs_key_field="instance_id",
+                    outputs=summary,
+                    raw_response=summary,
+                )
+            )
 
         elif cmd == "fetch-incidents":
             max_results = arg_to_int(
@@ -1262,8 +1797,8 @@ def main(
 
 if __name__ in ("__main__", "__builtin__", "builtins"):
     try:
-        integration_id = 48  # Change this to your integration ID
-        command = "fetch-incidents"  # Change to "test-module" or other supported command
+        integration_id = 59  # Change this to your integration ID
+        command = "gra-health-check"  # Change to "test-module" or other supported command
 
         ctx = main(integration_id=integration_id, command=command)
         print(json.dumps(ctx.snapshot(), default=str, indent=2))

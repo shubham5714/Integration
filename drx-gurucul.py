@@ -1,8 +1,10 @@
 """DRX Gurucul GRA integration for non-Demisto execution.
 
-``main(integration_id, command)`` loads config and state from Supabase,
-runs the command, and persists ``last_run``. I/O uses embedded ``RuntimeContext``
-and CommonServerPython helpers inlined for standalone Python execution.
+``main(integration_id, command, args=...)`` loads config and state from Supabase,
+runs the command, and persists ``last_run``. For ``health-check``, pass a single
+check via ``args`` / ``argue`` (``query``, ``health_check_list``, etc.) rather than
+loading from ``instance_health_checks``. I/O uses embedded ``RuntimeContext`` and
+CommonServerPython helpers inlined for standalone Python execution.
 """
 
 from __future__ import annotations
@@ -339,7 +341,6 @@ except Exception:
         )
 
 SUPABASE_DEV_TICKETS_TABLE = "dev_tickets"
-SUPABASE_INSTANCE_HEALTH_CHECKS_TABLE = "instance_health_checks"
 
 _runtime: Optional[RuntimeContext] = None
 
@@ -855,6 +856,9 @@ def _health_check_ticket_row(
     instance_name: str,
     tenant_id: Any,
     health_check_id: Any = None,
+    mail_notification_group: Any = None,
+    chat_notification_group: Any = None,
+    assessment_check: Any = None,
 ) -> Dict[str, Any]:
     """Build a ``dev_tickets`` row for a missing health-check item."""
     value = item.get("value") or ""
@@ -878,7 +882,12 @@ def _health_check_ticket_row(
         "severity": severity,
         "events": raw_logs,
     }
-    return {
+    ticket_health_check_id = (
+        assessment_check
+        if assessment_check not in (None, "")
+        else health_check_id
+    )
+    row: Dict[str, Any] = {
         "name": name,
         "severity": severity,
         "raw_logs": raw_logs,
@@ -892,8 +901,15 @@ def _health_check_ticket_row(
         "alert_source": "/assets/images/brand-logos/desktop-dark-2.png",
         "source_id": "",
         "type": "health-check",
-        "health_check_id": health_check_id,
+        "health_check_id": ticket_health_check_id,
     }
+    if mail_notification_group not in (None, ""):
+        row["mail_notification_group"] = mail_notification_group
+    if chat_notification_group not in (None, ""):
+        row["chat_notification_group"] = chat_notification_group
+    if assessment_check not in (None, ""):
+        row["assessment_check"] = assessment_check
+    return row
 
 
 def _match_key(value: Any) -> str:
@@ -924,207 +940,207 @@ def _values_from_search_result(events: list, match_field: str) -> dict[str, str]
 
 
 @task(log_prints=True)
-def get_instance_health_checks(instance_id: int) -> list[dict[str, Any]]:
-    """Load rows from ``instance_health_checks`` for an integration instance."""
-    supabase = get_supabase_client()
-    r = (
-        supabase.table(SUPABASE_INSTANCE_HEALTH_CHECKS_TABLE)
-        .select("*")
-        .eq("instance_id", instance_id)
-        .execute()
-    )
-    rows = [row for row in (r.data or []) if isinstance(row, dict)]
-    # Prefer enabled rows when column exists; keep all if column absent.
-    enabled_rows = [row for row in rows if row.get("enabled") is not False]
-    print(
-        f"[health-check] instance_id={instance_id} "
-        f"rows={len(rows)} enabled={len(enabled_rows)}"
-    )
-    return enabled_rows
-
-
-@task(log_prints=True)
 def gra_health_check_command(
     client: Client,
     instance_id: int,
     params: Optional[Dict[str, Any]] = None,
+    check_args: Optional[Dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Run configured health checks: query GRA and flag missing expected items.
+    """Run one health check from ``check_args``: query GRA and flag missing expected items.
 
-    For each ``instance_health_checks`` row:
-      - run ``query`` via ``search_big_data_events``
-      - compare ``health_check_list`` (or ``items``) against Result values of ``match_field``
-      - print stoppage for each missing item and insert a ``dev_tickets`` row
+    Required ``check_args`` keys: ``query``, ``health_check_list`` (or ``items``).
+
+    Optional: ``match_field``, ``assessment_check``, ``mail_notification_group``,
+    ``chat_notification_group``, ``name``, ``page``, ``max``, ``period``, date fields,
+    ``item_label``, ``tenant_id``.
     """
     params = params or {}
+    check = dict(check_args or {})
     instance_name = str(params.get("instance_name") or f"instance-{instance_id}")
-    checks = get_instance_health_checks(instance_id)
+    assessment_check = check.get("assessment_check")
+    check_id = (
+        assessment_check
+        if assessment_check not in (None, "")
+        else check.get("id") or check.get("health_check_id")
+    )
+    check_name = (
+        check.get("name")
+        or check.get("check_name")
+        or (f"assessment-{assessment_check}" if assessment_check not in (None, "") else None)
+        or (f"check-{check_id}" if check_id not in (None, "") else "health-check")
+    )
+    mail_notification_group = check.get("mail_notification_group")
+    chat_notification_group = check.get("chat_notification_group")
+
     summary: dict[str, Any] = {
         "instance_id": instance_id,
-        "checks": [],
+        "assessment_check": assessment_check,
+        "mail_notification_group": mail_notification_group,
+        "chat_notification_group": chat_notification_group,
         "missing_total": 0,
         "tickets_inserted": 0,
     }
-    if not checks:
-        print(f"[health-check] no rows in {SUPABASE_INSTANCE_HEALTH_CHECKS_TABLE}")
-        return summary
 
-    for check in checks:
-        check_id = check.get("id")
-        check_name = check.get("name") or check.get("check_name") or f"check-{check_id}"
-        query = check.get("query") or ""
-        match_field = str(check.get("match_field") or "hostname").strip() or "hostname"
-        default_item_label = str(check.get("item_label") or "device").strip() or "device"
-        tenant_id = check.get("tenant_id")
-        if tenant_id in (None, ""):
-            tenant_id = params.get("tenant_id", "")
-        expected_items = _normalize_health_items(
-            check.get("health_check_list")
-            if check.get("health_check_list") not in (None, "")
-            else check.get("items")
-        )
-        expected_values = [item["value"] for item in expected_items]
-        page = arg_to_int(arg=check.get("page"), arg_name="page", required=False) or 1
-        max_events = (
-            arg_to_int(arg=check.get("max"), arg_name="max", required=False) or 100
-        )
-        from_date, to_date = resolve_search_time_window(
-            from_date=check.get("eventFromDate")
-            or check.get("fromDate")
-            or check.get("from_date")
-            or check.get("startDate"),
-            to_date=check.get("eventToDate")
-            or check.get("toDate")
-            or check.get("to_date")
-            or check.get("endDate"),
-            period=check.get("period"),
-            default_period="1 hour",
-        )
+    query = check.get("query") or ""
+    match_field = str(check.get("match_field") or "hostname").strip() or "hostname"
+    default_item_label = str(check.get("item_label") or "device").strip() or "device"
+    tenant_id = check.get("tenant_id")
+    if tenant_id in (None, ""):
+        tenant_id = params.get("tenant_id", "")
+    expected_items = _normalize_health_items(
+        check.get("health_check_list")
+        if check.get("health_check_list") not in (None, "")
+        else check.get("items")
+    )
+    expected_values = [item["value"] for item in expected_items]
+    page = arg_to_int(arg=check.get("page"), arg_name="page", required=False) or 1
+    max_events = arg_to_int(arg=check.get("max"), arg_name="max", required=False) or 100
+    from_date, to_date = resolve_search_time_window(
+        from_date=check.get("eventFromDate")
+        or check.get("fromDate")
+        or check.get("from_date")
+        or check.get("startDate"),
+        to_date=check.get("eventToDate")
+        or check.get("toDate")
+        or check.get("to_date")
+        or check.get("endDate"),
+        period=check.get("period"),
+        default_period="1 hour",
+    )
 
-        print(
-            f"[health-check] start name={check_name!r} id={check_id} "
-            f"match_field={match_field!r} expected={len(expected_items)} "
-            f"eventFromDate={from_date!r} eventToDate={to_date!r} query={query!r}"
-        )
-        if not query:
-            print(f"[health-check] skip name={check_name!r} — empty query")
-            summary["checks"].append(
-                {
-                    "id": check_id,
-                    "name": check_name,
-                    "status": "skipped",
-                    "reason": "empty query",
-                    "missing": [],
-                }
-            )
-            continue
-
-        events = search_big_data_events(
-            client,
-            expression=str(query),
-            page=page,
-            max_events=max_events,
-            from_date=from_date,
-            to_date=to_date,
-            retries=1,
-            log_prefix=f"[health-check] name={check_name!r}",
-        )
-        found_map = _values_from_search_result(events, match_field)
-        found_keys = set(found_map.keys())
-        found_values = sorted(found_map.values(), key=str.casefold)
-        missing_items = [
-            item
-            for item in expected_items
-            if _match_key(item["value"]) not in found_keys
-        ]
-        matched_items = [
-            item
-            for item in expected_items
-            if _match_key(item["value"]) in found_keys
-        ]
-        expected_keys = {_match_key(v) for v in expected_values}
-        extra = [
-            value
-            for key, value in found_map.items()
-            if key not in expected_keys
-        ]
-
-        print(
-            f"[health-check] Result ({len(events)} row(s)) for "
-            f"match_field={match_field!r}:\n"
-            f"{json.dumps(events, default=str, indent=2)}"
-        )
-        print(
-            f"[health-check] extracted {match_field} values "
-            f"({len(found_values)}): {found_values}"
-        )
-        print(
-            f"[health-check] expected values ({len(expected_values)}): {expected_values}"
-        )
-        if extra:
-            print(
-                f"[health-check] in Result but not in health_check_list "
-                f"({len(extra)}): {extra}"
-            )
-
-        tickets_for_check = 0
-        for item in missing_items:
-            label = item["type"] or default_item_label
-            print(
-                f"[health-check] log stoppage observed for this {label}: {item['value']} "
-                f"severity={item.get('severity')!r} (check={check_name!r})"
-            )
-            ticket = _health_check_ticket_row(
-                item=item,
-                instance_name=instance_name,
-                tenant_id=tenant_id,
-                health_check_id=check_id,
-            )
-            print(
-                f"[health-check] inserting ticket name={ticket['name']!r} "
-                f"severity={ticket['severity']!r}"
-            )
-            insert_incident_row_in_supabase(ticket)
-            tickets_for_check += 1
-            summary["tickets_inserted"] += 1
-
-        for item in matched_items:
-            label = item["type"] or default_item_label
-            api_value = found_map[_match_key(item["value"])]
-            note = f" (api={api_value!r})" if api_value != item["value"] else ""
-            print(
-                f"[health-check] ok {label}={item['value']}{note} "
-                f"(check={check_name!r})"
-            )
-
-        print(
-            f"[health-check] done name={check_name!r} "
-            f"result_count={len(events)} found={len(matched_items)} "
-            f"missing={len(missing_items)} tickets={tickets_for_check}"
-        )
-        summary["missing_total"] += len(missing_items)
-        summary["checks"].append(
+    if not query:
+        print(f"[health-check] skip name={check_name!r} — empty query")
+        summary.update(
             {
                 "id": check_id,
                 "name": check_name,
-                "status": "ok" if not missing_items else "stoppage",
-                "match_field": match_field,
-                "eventFromDate": from_date,
-                "eventToDate": to_date,
-                "expected_count": len(expected_items),
-                "found_count": len(matched_items),
-                "result_count": len(events),
-                "result": events,
-                "found_values": found_values,
-                "missing": missing_items,
-                "extra": extra,
-                "tickets_inserted": tickets_for_check,
+                "status": "skipped",
+                "reason": "empty query",
+                "missing": [],
             }
+        )
+        return summary
+
+    if not expected_items:
+        print(f"[health-check] skip name={check_name!r} — empty health_check_list")
+        summary.update(
+            {
+                "id": check_id,
+                "name": check_name,
+                "status": "skipped",
+                "reason": "empty health_check_list",
+                "missing": [],
+            }
+        )
+        return summary
+
+    print(
+        f"[health-check] start name={check_name!r} id={check_id} "
+        f"assessment_check={assessment_check!r} "
+        f"match_field={match_field!r} expected={len(expected_items)} "
+        f"eventFromDate={from_date!r} eventToDate={to_date!r} query={query!r}"
+    )
+
+    events = search_big_data_events(
+        client,
+        expression=str(query),
+        page=page,
+        max_events=max_events,
+        from_date=from_date,
+        to_date=to_date,
+        retries=1,
+        log_prefix=f"[health-check] name={check_name!r}",
+    )
+    found_map = _values_from_search_result(events, match_field)
+    found_keys = set(found_map.keys())
+    found_values = sorted(found_map.values(), key=str.casefold)
+    missing_items = [
+        item for item in expected_items if _match_key(item["value"]) not in found_keys
+    ]
+    matched_items = [
+        item for item in expected_items if _match_key(item["value"]) in found_keys
+    ]
+    expected_keys = {_match_key(v) for v in expected_values}
+    extra = [value for key, value in found_map.items() if key not in expected_keys]
+
+    print(
+        f"[health-check] Result ({len(events)} row(s)) for "
+        f"match_field={match_field!r}:\n"
+        f"{json.dumps(events, default=str, indent=2)}"
+    )
+    print(
+        f"[health-check] extracted {match_field} values "
+        f"({len(found_values)}): {found_values}"
+    )
+    print(f"[health-check] expected values ({len(expected_values)}): {expected_values}")
+    if extra:
+        print(
+            f"[health-check] in Result but not in health_check_list "
+            f"({len(extra)}): {extra}"
+        )
+
+    tickets_for_check = 0
+    for item in missing_items:
+        label = item["type"] or default_item_label
+        print(
+            f"[health-check] log stoppage observed for this {label}: {item['value']} "
+            f"severity={item.get('severity')!r} (check={check_name!r})"
+        )
+        ticket = _health_check_ticket_row(
+            item=item,
+            instance_name=instance_name,
+            tenant_id=tenant_id,
+            health_check_id=check_id,
+            mail_notification_group=mail_notification_group,
+            chat_notification_group=chat_notification_group,
+            assessment_check=assessment_check,
+        )
+        print(
+            f"[health-check] inserting ticket name={ticket['name']!r} "
+            f"severity={ticket['severity']!r}"
+        )
+        insert_incident_row_in_supabase(ticket)
+        tickets_for_check += 1
+
+    for item in matched_items:
+        label = item["type"] or default_item_label
+        api_value = found_map[_match_key(item["value"])]
+        note = f" (api={api_value!r})" if api_value != item["value"] else ""
+        print(
+            f"[health-check] ok {label}={item['value']}{note} "
+            f"(check={check_name!r})"
         )
 
     print(
+        f"[health-check] done name={check_name!r} "
+        f"result_count={len(events)} found={len(matched_items)} "
+        f"missing={len(missing_items)} tickets={tickets_for_check}"
+    )
+
+    summary.update(
+        {
+            "id": check_id,
+            "name": check_name,
+            "status": "ok" if not missing_items else "stoppage",
+            "match_field": match_field,
+            "eventFromDate": from_date,
+            "eventToDate": to_date,
+            "expected_count": len(expected_items),
+            "found_count": len(matched_items),
+            "result_count": len(events),
+            "result": events,
+            "found_values": found_values,
+            "missing": missing_items,
+            "extra": extra,
+            "tickets_inserted": tickets_for_check,
+            "missing_total": len(missing_items),
+        }
+    )
+
+    print(
         f"[health-check] complete instance_id={instance_id} "
-        f"checks={len(summary['checks'])} missing_total={summary['missing_total']} "
+        f"assessment_check={assessment_check!r} "
+        f"missing_total={summary['missing_total']} "
         f"tickets_inserted={summary['tickets_inserted']}"
     )
     return summary
@@ -1499,18 +1515,27 @@ def main(
     integration_id: int = None,
     command: str = None,
     args: Optional[Dict[str, Any]] = None,
+    argue: Optional[Dict[str, Any]] = None,
 ) -> RuntimeContext:
-    """Run the integration using Supabase-backed params (merged with local defaults)."""
+    """Run the integration using Supabase-backed params (merged with local defaults).
+
+    For ``health-check``, pass check parameters via ``args`` or ``argue`` (alias):
+    ``query``, ``match_field``, ``health_check_list``, ``assessment_check``,
+    ``mail_notification_group``, ``chat_notification_group``, etc.
+    """
     if integration_id is None:
         raise ValueError(
             "Integration ID is required. Usage: main(integration_id=1, command='fetch-incidents')"
         )
 
     resolved_command = command or "test-module"
+    merged_args = dict(args or {})
+    if argue:
+        merged_args.update(argue)
     payload = {
         "command": resolved_command,
         "params": get_supabase_params(integration_id, resolved_command),
-        "args": dict(args or {}),
+        "args": merged_args,
         "state": {
             "last_run": get_last_run_from_supabase(integration_id),
             "integration_context": {},
@@ -1573,7 +1598,10 @@ def main(
 
         elif cmd == "health-check":
             summary = gra_health_check_command(
-                client, instance_id=integration_id, params=params
+                client,
+                instance_id=integration_id,
+                params=params,
+                check_args=arguments,
             )
             return_results(
                 CommandResults(
@@ -1798,10 +1826,24 @@ def main(
 
 if __name__ in ("__main__", "__builtin__", "builtins"):
     try:
-        integration_id = 59  # Change this to your integration ID
-        command = "health-check"  # Change to "test-module" or other supported command
+        integration_id = 15
+        command = "health-check"
+        argue = {
+            "query": "your GRA search expression",
+            "match_field": "hostname",
+            "health_check_list": [
+                {"type": "Firewall", "value": "HOST1", "severity": "High"},
+            ],
+            "mail_notification_group": "soc-alerts",
+            "chat_notification_group": "soc-chat",
+            "assessment_check": 42,
+        }
 
-        ctx = main(integration_id=integration_id, command=command)
+        ctx = main(
+            integration_id=integration_id,
+            command=command,
+            argue=argue,
+        )
         print(json.dumps(ctx.snapshot(), default=str, indent=2))
     except Exception as e:
         print(f"Script execution failed: {e}")

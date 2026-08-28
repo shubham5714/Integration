@@ -856,11 +856,11 @@ def _health_check_ticket_row(
     instance_name: str,
     tenant_id: Any,
     health_check_id: Any = None,
-    mail_notification_group: Any = None,
-    chat_notification_group: Any = None,
-    assessment_check: Any = None,
 ) -> Dict[str, Any]:
-    """Build a ``dev_tickets`` row for a missing health-check item."""
+    """Build a ``dev_tickets`` row for a missing health-check item.
+
+    ``health_check_id`` is the assessment check id (``assessment_check`` from args).
+    """
     value = item.get("value") or ""
     item_type = item.get("type") or "device"
     severity = item.get("severity") or "High"
@@ -882,11 +882,7 @@ def _health_check_ticket_row(
         "severity": severity,
         "events": raw_logs,
     }
-    ticket_health_check_id = (
-        assessment_check
-        if assessment_check not in (None, "")
-        else health_check_id
-    )
+
     row: Dict[str, Any] = {
         "name": name,
         "severity": severity,
@@ -901,14 +897,9 @@ def _health_check_ticket_row(
         "alert_source": "/assets/images/brand-logos/desktop-dark-2.png",
         "source_id": "",
         "type": "health-check",
-        "health_check_id": ticket_health_check_id,
     }
-    if mail_notification_group not in (None, ""):
-        row["mail_notification_group"] = mail_notification_group
-    if chat_notification_group not in (None, ""):
-        row["chat_notification_group"] = chat_notification_group
-    if assessment_check not in (None, ""):
-        row["assessment_check"] = assessment_check
+    if health_check_id not in (None, ""):
+        row["health_check_id"] = health_check_id
     return row
 
 
@@ -1091,9 +1082,6 @@ def gra_health_check_command(
             instance_name=instance_name,
             tenant_id=tenant_id,
             health_check_id=check_id,
-            mail_notification_group=mail_notification_group,
-            chat_notification_group=chat_notification_group,
-            assessment_check=assessment_check,
         )
         print(
             f"[health-check] inserting ticket name={ticket['name']!r} "

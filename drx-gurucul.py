@@ -943,7 +943,7 @@ def gra_health_check_command(
 
     Optional: ``match_field``, ``assessment_check``, ``mail_notification_group``,
     ``chat_notification_group``, ``name``, ``page``, ``max``, ``period``, date fields,
-    ``item_label``, ``tenant_id``.
+    ``item_label``, ``tenant_id`` (from assessment_check; used on ``dev_tickets`` only).
     """
     params = params or {}
     check = dict(check_args or {})
@@ -976,8 +976,6 @@ def gra_health_check_command(
     match_field = str(check.get("match_field") or "hostname").strip() or "hostname"
     default_item_label = str(check.get("item_label") or "device").strip() or "device"
     tenant_id = check.get("tenant_id")
-    if tenant_id in (None, ""):
-        tenant_id = params.get("tenant_id", "")
     expected_items = _normalize_health_items(
         check.get("health_check_list")
         if check.get("health_check_list") not in (None, "")
@@ -1816,6 +1814,7 @@ if __name__ in ("__main__", "__builtin__", "builtins"):
             "mail_notification_group": "soc-alerts",
             "chat_notification_group": "soc-chat",
             "assessment_check": 42,
+            "tenant_id": "7ebe0e31-220e-4ae9-bdc3-9f2a51d17a35",
         }
 
         ctx = main(

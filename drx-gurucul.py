@@ -1090,15 +1090,6 @@ def gra_health_check_command(
         insert_incident_row_in_supabase(ticket)
         tickets_for_check += 1
 
-    for item in matched_items:
-        label = item["type"] or default_item_label
-        api_value = found_map[_match_key(item["value"])]
-        note = f" (api={api_value!r})" if api_value != item["value"] else ""
-        print(
-            f"[health-check] ok {label}={item['value']}{note} "
-            f"(check={check_name!r})"
-        )
-
     print(
         f"[health-check] done name={check_name!r} "
         f"result_count={len(events)} found={len(matched_items)} "

@@ -1,10 +1,10 @@
 """DRX Gurucul GRA integration for non-Demisto execution.
 
 ``main(integration_id, command, args=...)`` loads config and state from Supabase,
-runs the command, and persists ``last_run``. For ``health-check``, pass a single
-check via ``args`` / ``argue`` (``query``, ``health_check_list``, etc.) rather than
-loading from ``instance_health_checks``. I/O uses embedded ``RuntimeContext`` and
-CommonServerPython helpers inlined for standalone Python execution.
+runs the command, and persists ``last_run``. Flow results persist to a saved
+Prefect ``S3Bucket`` block (``s3-bucket/<name>``). For ``health-check``, pass a
+single check via ``args`` / ``argue``. I/O uses embedded ``RuntimeContext`` and
+CommonServerPython helpers inlined for standalone Python.
 """
 
 from __future__ import annotations
@@ -1483,18 +1483,49 @@ def insert_incident_row_in_supabase(incident: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Prefect flow result storage (S3Bucket block)
+# ---------------------------------------------------------------------------
+# Create once (uses default Boto3 credential chain unless AwsCredentials is set):
+#
+#   from prefect_aws.s3 import S3Bucket
+#   S3Bucket(bucket_name="astra-archives", bucket_folder="prefect-results/gurucul").save(
+#       "aws-s3", overwrite=True
+#   )
+#
+# Then reference as ``s3-bucket/<block-name>`` below.
+# Override with env ``PREFECT_GURUCUL_RESULTS_S3_BLOCK`` (full slug).
+
+_FLOW_RESULT_STORAGE = (
+    os.environ.get("PREFECT_GURUCUL_RESULTS_S3_BLOCK") or "s3-bucket/aws-s3"
+).strip()
+
+# Caller retrieval after run_deployment (Prefect 3.8):
+#   final_state = flow_run.state
+#   snapshot = final_state.result(raise_on_failure=True)
+# Caller needs AWS read access to the same S3 bucket as the block.
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
 
-@flow(log_prints=True)
+@flow(
+    log_prints=True,
+    persist_result=True,
+    result_storage=_FLOW_RESULT_STORAGE,
+    result_serializer="json",
+)
 def main(
     integration_id: int = None,
     command: str = None,
     args: Optional[Dict[str, Any]] = None,
     argue: Optional[Dict[str, Any]] = None,
-) -> RuntimeContext:
+) -> Dict[str, Any]:
     """Run the integration using Supabase-backed params (merged with local defaults).
+
+    Returns a JSON-serializable snapshot persisted via the configured
+    ``S3Bucket`` block (``persist_result=True``).
 
     For ``health-check``, pass check parameters via ``args`` or ``argue`` (alias):
     ``query``, ``match_field``, ``health_check_list``, ``assessment_check``,
@@ -1798,7 +1829,7 @@ def main(
                 f"Supabase last_run update failed (id={integration_id}): {supabase_error}"
             )
 
-    return runtime_ctx
+    return runtime_ctx.snapshot()
 
 
 if __name__ in ("__main__", "__builtin__", "builtins"):
@@ -1822,7 +1853,7 @@ if __name__ in ("__main__", "__builtin__", "builtins"):
             command=command,
             argue=argue,
         )
-        print(json.dumps(ctx.snapshot(), default=str, indent=2))
+        print(json.dumps(ctx, default=str, indent=2))
     except Exception as e:
         print(f"Script execution failed: {e}")
         traceback.print_exc()

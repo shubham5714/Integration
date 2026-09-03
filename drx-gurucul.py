@@ -1523,11 +1523,11 @@ def main(
     command: str = None,
     args: Optional[Dict[str, Any]] = None,
     argue: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+) -> Dict[str, Any] | list:
     """Run the integration using Supabase-backed params (merged with local defaults).
 
-    Returns a JSON-serializable snapshot persisted via the configured
-    ``S3Bucket`` block (``persist_result=True``).
+    ``gra-search`` returns the GRA Result list only (persisted to S3 as-is).
+    Other commands return a RuntimeContext snapshot dict.
 
     For ``health-check``, pass check parameters via ``args`` or ``argue`` (alias):
     ``query``, ``match_field``, ``health_check_list``, ``assessment_check``,
@@ -1560,6 +1560,7 @@ def main(
     arguments = runtime_ctx.args
     cmd = runtime_ctx.command
     log = runtime_ctx.logger
+    search_events: list | None = None
 
     try:
         api_key = params.get("apikey")
@@ -1596,15 +1597,8 @@ def main(
                 return_error("Error in service")
 
         elif cmd == "gra-search":
-            events = gra_search_command(client, arguments)
-            return_results(
-                CommandResults(
-                    outputs_prefix="Gra.Search",
-                    outputs_key_field="",
-                    outputs=events,
-                    raw_response=events,
-                )
-            )
+            # Persist GRA Result rows only — no CommandResults / snapshot envelope.
+            search_events = gra_search_command(client, arguments)
 
         elif cmd == "health-check":
             summary = gra_health_check_command(
@@ -1831,6 +1825,10 @@ def main(
                 f"Supabase last_run update failed (id={integration_id}): {supabase_error}"
             )
 
+    if cmd == "gra-search":
+        if runtime_ctx.output.errors:
+            raise IntegrationError(runtime_ctx.output.errors[-1])
+        return search_events if search_events is not None else []
     return runtime_ctx.snapshot()
 
 

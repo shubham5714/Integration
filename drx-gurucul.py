@@ -930,7 +930,7 @@ def _values_from_search_result(events: list, match_field: str) -> dict[str, str]
     return found
 
 
-@task(log_prints=True)
+@task(log_prints=True, persist_result=False)
 def gra_health_check_command(
     client: Client,
     instance_id: int,
@@ -1123,7 +1123,7 @@ def gra_health_check_command(
     return summary
 
 
-@task(log_prints=True)
+@task(log_prints=True, persist_result=False)
 def fetch_incidents(
     client: Client,
     max_results: int,
@@ -1283,7 +1283,7 @@ def fetch_incidents(
     return next_run, incidents
 
 
-@task(log_prints=True)
+@task(log_prints=True, persist_result=False)
 def test_module_command(client: Client) -> str:
     try:
         client.validate_api_key()
@@ -1299,7 +1299,7 @@ def test_module_command(client: Client) -> str:
 # Supabase helpers
 # ---------------------------------------------------------------------------
 
-@task(log_prints=True)
+@task(log_prints=True, persist_result=False)
 def get_supabase_client() -> SupabaseClient:
     if not SUPABASE_AVAILABLE or create_client is None:
         raise RuntimeError("Install supabase: pip install supabase")
@@ -1343,7 +1343,7 @@ def _local_gurucul_params(command: str) -> Dict[str, Any]:
     }
 
 
-@task(log_prints=True)
+@task(log_prints=True, persist_result=False)
 def get_supabase_params(integration_id: int, command: str) -> Dict[str, Any]:
     """Merge local defaults with selected Supabase configuration + instance fields.
 
@@ -1399,7 +1399,7 @@ def get_supabase_params(integration_id: int, command: str) -> Dict[str, Any]:
     return params
 
 
-@task(log_prints=True)
+@task(log_prints=True, persist_result=False)
 def get_last_run_from_supabase(integration_id: int) -> Dict[str, Any]:
     supabase = get_supabase_client()
     r = (
@@ -1415,7 +1415,7 @@ def get_last_run_from_supabase(integration_id: int) -> Dict[str, Any]:
     return last_run if isinstance(last_run, dict) else {}
 
 
-@task(log_prints=True)
+@task(log_prints=True, persist_result=False)
 def update_last_run_in_supabase(integration_id: int, last_run: Dict[str, Any]) -> None:
     supabase = get_supabase_client()
     supabase.table("integration_instances").update({"last_run": last_run}).eq(
@@ -1441,7 +1441,7 @@ def _as_jsonb(value: Any, *, empty: Any = None) -> Any:
     return value
 
 
-@task(log_prints=True)
+@task(log_prints=True, persist_result=False)
 def insert_incident_row_in_supabase(incident: Dict[str, Any]) -> None:
     """Insert a single fetched incident into Supabase (``dev_tickets``)."""
     if not SUPABASE_AVAILABLE or create_client is None:
@@ -1494,6 +1494,8 @@ def insert_incident_row_in_supabase(incident: Dict[str, Any]) -> None:
 #
 # Then reference as ``s3-bucket/<block-name>`` below.
 # Override with env ``PREFECT_GURUCUL_RESULTS_S3_BLOCK`` (full slug).
+# Tasks use persist_result=False so only the flow snapshot is written to S3
+# (task returns like Supabase Client are not JSON-serializable).
 
 _FLOW_RESULT_STORAGE = (
     os.environ.get("PREFECT_GURUCUL_RESULTS_S3_BLOCK") or "s3-bucket/aws-s3"

@@ -16,7 +16,7 @@ import time
 import traceback
 from dataclasses import dataclass
 import dataclasses as _dc
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import dateparser
@@ -326,6 +326,9 @@ urllib3.disable_warnings()
 
 MAX_INCIDENTS_TO_FETCH = 25
 API_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+# /alerts/All can omit an alert for a few seconds after it appears in the UI.
+# Keep the next startDate this far behind "now" so that gap is queried again.
+FETCH_LAG_SECONDS = 120
 SUPABASE_URL = "https://zhhsijigoupqroztdrdy.supabase.co"
 
 # Sync load — module-level ``await`` is invalid when Prefect imports this as a script.
@@ -738,7 +741,7 @@ def search_big_data_events(
         time.sleep(retry_delay_sec)
         events = _once(attempt=attempt)
     if not events:
-        print(f"{log_prefix} still 0 events after {attempts} attempt(s) — continuing")
+        print(f"{log_prefix} still 0 events after {attempts} attempt(s)")
     return events
 
 
@@ -752,6 +755,7 @@ def fetch_alert_raw_logs(
         page=1,
         max_events=max_events,
         retries=1,
+        retry_delay_sec=10.0,
         log_prefix=f"[raw_logs] alertId={alert_id}",
     )
 
@@ -996,6 +1000,19 @@ def gra_health_check_command(
         period=check.get("period"),
         default_period="1 hour",
     )
+    # GRA rejects an end equal to its clock ("future dates"). Keep the
+    # search end 2 minutes behind the resolved end.
+    if to_date:
+        end = datetime.strptime(to_date, API_DATE_FORMAT).replace(
+            tzinfo=timezone.utc
+        ) - timedelta(minutes=2)
+        to_date = _format_api_datetime(end)
+        if from_date:
+            start = datetime.strptime(from_date, API_DATE_FORMAT).replace(
+                tzinfo=timezone.utc
+            )
+            if start > end:
+                from_date = to_date
 
     if not query:
         print(f"[health-check] skip name={check_name!r} — empty query")
@@ -1132,16 +1149,22 @@ def fetch_incidents(
     raw_logs_fetch_size: int = 25,
     severity_thresholds: Optional[Dict[str, int]] = None,
     export_defaults: Optional[Dict[str, Any]] = None,
+    fetch_lag_seconds: int = FETCH_LAG_SECONDS,
 ) -> tuple[dict[str, int], list[dict]]:
     """Fetch GRA alerts via ``/alerts/All`` and enrich each with big-data events.
 
     Lists the date window (API is descending), sorts ascending by
     ``detectionTimestamp``, then fetches ``raw_logs`` only for the oldest
     ``max_results`` alerts. Cursor advances to the latest processed detection
-    time when more candidates remain; otherwise to now.
+    time when more candidates remain. When the window is drained it stops
+    ``fetch_lag_seconds`` behind now, so alerts the list API has not indexed
+    yet stay inside the next startDate. ``maxAlertId`` drops repeats.
+    An alert whose raw logs are still empty after retry is not saved. The
+    cursor stays on that alert so the next run fetches it again.
     """
     thresholds = severity_thresholds or _resolve_severity_thresholds()
     export_defaults = export_defaults or _export_defaults_from_params()
+    lag_seconds = max(0, min(int(fetch_lag_seconds), 3600))
     last_fetch = last_run.get("last_fetch", None)
     prev_max_alert_id = last_run.get("maxAlertId")
 
@@ -1166,7 +1189,10 @@ def fetch_incidents(
         print(f"[fetch] resume from last_fetch={last_fetch}, maxAlertId={prev_max_alert_id}")
 
     print(f"[fetch] time window from={start_date!r} to={end_date!r}")
-    print(f"[fetch] max_fetch={max_results}, raw_logs_fetch_size={raw_logs_fetch_size}")
+    print(
+        f"[fetch] max_fetch={max_results}, raw_logs_fetch_size={raw_logs_fetch_size}, "
+        f"fetch_lag_seconds={lag_seconds}"
+    )
     print(
         f"[fetch] severity bands "
         f"High ({thresholds['high_min']}–{thresholds['high_max']}), "
@@ -1226,17 +1252,12 @@ def fetch_incidents(
 
     latest_detection_unix: int | None = None
     temp_max_alert_id = prev_max_alert_id
+    stopped_for_empty_raw_logs = False
+    retry_detection_unix: int | None = None
 
     for idx, record in enumerate(to_process, start=1):
         alert_id = record.get("alertId")
-        if temp_max_alert_id is None or alert_id > temp_max_alert_id:
-            temp_max_alert_id = alert_id
-
         detection_unix = _alert_detection_to_unix(record.get("detectionTimestamp"))
-        if detection_unix is not None and (
-            latest_detection_unix is None or detection_unix > latest_detection_unix
-        ):
-            latest_detection_unix = detection_unix
 
         print(
             f"[raw_logs] ({idx}/{len(to_process)}) alertId={alert_id} "
@@ -1247,6 +1268,24 @@ def fetch_incidents(
             client, alert_id, max_events=raw_logs_fetch_size
         )
         print(f"[raw_logs] alertId={alert_id} events={len(raw_logs)}")
+        if not raw_logs:
+            # Events are often indexed a few minutes after the alert. Saving now
+            # would advance maxAlertId and the next run would skip this alert.
+            stopped_for_empty_raw_logs = True
+            retry_detection_unix = detection_unix
+            print(
+                f"[raw_logs] alertId={alert_id} still empty after retry — "
+                f"stopping so the next run fetches this alert again"
+            )
+            break
+
+        if temp_max_alert_id is None or alert_id > temp_max_alert_id:
+            temp_max_alert_id = alert_id
+        if detection_unix is not None and (
+            latest_detection_unix is None or detection_unix > latest_detection_unix
+        ):
+            latest_detection_unix = detection_unix
+
         record["incidentType"] = record.get("incidentType") or "GRAAlert"
         raw_payload = dict(record)
         raw_payload["events"] = raw_logs
@@ -1263,12 +1302,29 @@ def fetch_incidents(
         )
         _finalize_incident_for_export(incidents[-1], export_defaults)
 
+    # Empty raw logs → park on that alert (inclusive startDate) and do not
+    # advance maxAlertId past it. Alerts saved earlier in this run stay saved.
     # More candidates left after max_fetch → resume from latest processed detection.
-    # Otherwise window drained → jump to now.
-    if more_remaining and latest_detection_unix is not None:
+    # Window drained → stop short of now so a late /alerts/All index still
+    # falls inside the next startDate. maxAlertId skips alerts already saved.
+    if stopped_for_empty_raw_logs:
+        if retry_detection_unix is not None:
+            next_last_fetch = retry_detection_unix
+        else:
+            next_last_fetch = int(last_fetch)
+        print(
+            f"[fetch] stopped on empty raw_logs — next run resumes at "
+            f"{_format_api_datetime(datetime.fromtimestamp(next_last_fetch, tz=timezone.utc))} "
+            f"maxAlertId={temp_max_alert_id}"
+        )
+    elif more_remaining and latest_detection_unix is not None:
         next_last_fetch = latest_detection_unix
     else:
-        next_last_fetch = url_access_time
+        next_last_fetch = max(0, url_access_time - lag_seconds)
+        print(
+            f"[fetch] window drained — holding cursor {lag_seconds}s behind now "
+            f"({_format_api_datetime(datetime.fromtimestamp(next_last_fetch, tz=timezone.utc))})"
+        )
 
     next_run: dict[str, int] = {
         "last_fetch": next_last_fetch,
@@ -1316,6 +1372,7 @@ SUPABASE_CONFIGURATION_KEYS = (
     "severity_high_min",
     "severity_medium_min",
     "raw_logs_fetch_size",
+    "fetch_lag_seconds",
 )
 
 
@@ -1329,6 +1386,7 @@ def _local_gurucul_params(command: str) -> Dict[str, Any]:
         "first_fetch": "1 days",
         "max_fetch": 1,  # alerts processed per run (oldest first)
         "raw_logs_fetch_size": 2,  # events per alert from searchBigDataEvents
+        "fetch_lag_seconds": FETCH_LAG_SECONDS,  # overlap so late-indexed alerts are re-queried
         # Severity score bands → labels High / Medium / Low
         "severity_high_min": 71,
         "severity_high_max": 100,
@@ -1348,7 +1406,7 @@ def get_supabase_params(integration_id: int, command: str) -> Dict[str, Any]:
     """Merge local defaults with selected Supabase configuration + instance fields.
 
     From ``configuration`` JSON only:
-      url, apikey, max_fetch, first_fetch, severity_*, raw_logs_fetch_size
+      url, apikey, max_fetch, first_fetch, severity_*, raw_logs_fetch_size, fetch_lag_seconds
 
     From instance row:
       tenant_id, instance_name, tenant_name, logo → alert_source
@@ -1633,6 +1691,15 @@ def main(
                 raw_logs_fetch_size = 25
             raw_logs_fetch_size = max(1, min(raw_logs_fetch_size, 500))
 
+            fetch_lag_seconds = arg_to_int(
+                arg=params.get("fetch_lag_seconds"),
+                arg_name="fetch_lag_seconds",
+                required=False,
+            )
+            if fetch_lag_seconds is None:
+                fetch_lag_seconds = FETCH_LAG_SECONDS
+            fetch_lag_seconds = max(0, min(fetch_lag_seconds, 3600))
+
             severity_thresholds = _resolve_severity_thresholds(params)
             export_defaults = _export_defaults_from_params(params)
 
@@ -1644,6 +1711,7 @@ def main(
                 raw_logs_fetch_size=raw_logs_fetch_size,
                 severity_thresholds=severity_thresholds,
                 export_defaults=export_defaults,
+                fetch_lag_seconds=fetch_lag_seconds,
             )
             runtime_ctx.state.set_last_run(next_run)
             runtime_ctx.output.emit_incidents(incidents)

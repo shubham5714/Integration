@@ -639,6 +639,8 @@ def _finalize_incident_for_export(
         "occurred_at": incident.get("occurred_at"),
         "raw_log": first,
     }
+    if incident.get("event_count") is not None:
+        incident["ai_message"]["event_count"] = incident["event_count"]
     for key, value in export_defaults.items():
         incident.setdefault(key, value)
 
@@ -758,6 +760,42 @@ def fetch_alert_raw_logs(
         retry_delay_sec=10.0,
         log_prefix=f"[raw_logs] alertId={alert_id}",
     )
+
+
+def _first_result_count(events: list) -> int | None:
+    """Read the first ``count()`` value from a GRA aggregation Result."""
+    if not events or not isinstance(events[0], dict):
+        return None
+    raw = events[0].get("count()")
+    if raw in (None, ""):
+        return None
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def fetch_alert_event_count(client: Client, alert_id: Any) -> int | None:
+    """Total events for an alert: same search with a count aggregation.
+
+    Expression is ``gra.alertid = "AL-{id}" group by eventday | count() order by count() desc``.
+    The inserted ``event_count`` is the first Result row's ``count()``.
+    """
+    events = search_big_data_events(
+        client,
+        expression=(
+            f'gra.alertid = "AL-{alert_id}" group by eventday | count() '
+            "order by count() desc"
+        ),
+        page=1,
+        max_events=1,
+        retries=1,
+        retry_delay_sec=10.0,
+        log_prefix=f"[event_count] alertId={alert_id}",
+    )
+    count = _first_result_count(events)
+    print(f"[event_count] alertId={alert_id} count={count!r}")
+    return count
 
 
 def gra_search_command(
@@ -1286,20 +1324,28 @@ def fetch_incidents(
         ):
             latest_detection_unix = detection_unix
 
+        event_count = fetch_alert_event_count(client, alert_id)
+
         record["incidentType"] = record.get("incidentType") or "GRAAlert"
         raw_payload = dict(record)
         raw_payload["events"] = raw_logs
+        if event_count is not None:
+            raw_payload["event_count"] = event_count
 
-        incidents.append(
-            {
-                "name": record.get("anomalyName") or record.get("entity") or str(alert_id),
-                "occurred_at": _alert_detection_to_occurred_at(record.get("detectionTimestamp")),
-                "severity": map_severity_label(record.get("severity"), thresholds),
-                "source_id": str(alert_id),
-                "rawJSON": raw_payload,
-                "raw_logs": raw_logs,
-            }
-        )
+        incident = {
+            "name": record.get("anomalyName") or record.get("entity") or str(alert_id),
+            "occurred_at": _alert_detection_to_occurred_at(record.get("detectionTimestamp")),
+            "severity": map_severity_label(record.get("severity"), thresholds),
+            "source_id": str(alert_id),
+            "rawJSON": raw_payload,
+            "raw_logs": raw_logs,
+        }
+        resource_name = record.get("resourceName")
+        if resource_name not in (None, ""):
+            incident["log_source"] = str(resource_name)
+        if event_count is not None:
+            incident["event_count"] = event_count
+        incidents.append(incident)
         _finalize_incident_for_export(incidents[-1], export_defaults)
 
     # Empty raw logs → park on that alert (inclusive startDate) and do not
@@ -1517,7 +1563,8 @@ def insert_incident_row_in_supabase(incident: Dict[str, Any]) -> None:
     print(
         f"[insert] inserting source_id={row.get('source_id')!r} "
         f"name={row.get('name')!r} occurred_at={row.get('occurred_at')!r} "
-        f"severity={row.get('severity')!r} raw_logs_count={raw_logs_count}"
+        f"severity={row.get('severity')!r} log_source={row.get('log_source')!r} "
+        f"event_count={row.get('event_count')!r} raw_logs_count={raw_logs_count}"
     )
     try:
         supabase = get_supabase_client()
